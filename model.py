@@ -338,6 +338,8 @@ class Patron(Base):
     # to borrow books. This identifier may change over time.
     authorization_identifier = Column(Unicode, unique=True, index=True)
 
+    hashed_identifier = Column(Unicode, nullable=False, index=True)
+
     # An identifier used by the patron that authenticates them,
     # but does not give them the authority to borrow books. i.e. their
     # website username.
@@ -362,6 +364,22 @@ class Patron(Base):
 
     AUDIENCE_RESTRICTION_POLICY = 'audiences'
     EXTERNAL_TYPE_REGULAR_EXPRESSION = 'external_type_regular_expression'
+
+    from sqlalchemy.ext.hybrid import Comparator, hybrid_property
+    @hybrid_property
+    def original_identifier(self):
+        raise NotImplementedError("Comparison only supported in the database")
+
+    class HashedIdentifierComparator(Comparator):
+        def __init__(self, hashed_identifier):
+            self.hashed_identifier = hashed_identifier
+        def __eq__(self, identifier):
+            from sqlalchemy import func
+            return self.hashed_identifier == func.crypt(identifier, self.hashed_identifier)
+
+    @original_identifier.comparator
+    def original_identifier(self):
+        return Patron.HashedIdentifierComparator(self.hashed_identifier)
 
     def works_on_loan(self):
         db = Session.object_session(self)
