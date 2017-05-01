@@ -5171,12 +5171,12 @@ class Genre(Base):
                                cascade="all, delete, delete-orphan")
 
     def __repr__(self):
+        if classifier.genres.get(self.name):
+            length = len(classifier.genres[self.name].subgenres)
+        else:
+            length = 0
         return "<Genre %s (%d subjects, %d works, %d subcategories)>" % (
-            self.name, len(self.subjects), len(self.works),
-            if classifier.genres.get(self.name):
-                len(classifier.genres[self.name].subgenres))
-            else:
-                return 0
+            self.name, len(self.subjects), len(self.works), length)
 
     @classmethod
     def lookup(cls, _db, name, autocreate=False):
