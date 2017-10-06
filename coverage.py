@@ -5,6 +5,11 @@ import logging
 from sqlalchemy.orm.session import Session
 from sqlalchemy.sql.functions import func
 
+from workerpool import (
+    Job,
+    WorkerPool,
+)
+
 from model import (
     get_one,
     get_one_or_create,
@@ -78,6 +83,22 @@ class CoverageFailure(object):
         return record
 
 
+class CoverageJob(Job):
+
+    """A workerpool.Job to cover an item for any CoverageProvider in a
+    multithreaded context. This job should be used with a workerpool.WorkerPool
+    """
+
+    def __init__(self, provider, item, results):
+        self.provider = provider
+        self.item = item
+        self.results = results
+
+    def run(self):
+        result = self.provider.process_item(item)
+        self.results.append(result)
+
+
 class BaseCoverageProvider(object):
 
     """Run certain objects through an algorithm. If the algorithm returns
@@ -113,15 +134,28 @@ class BaseCoverageProvider(object):
     # `batch_size` in the constructor, but generally nobody bothers
     # doing this.
     DEFAULT_BATCH_SIZE = 100
-    
-    def __init__(self, _db, batch_size=None, cutoff_time=None):
+
+    # In your subclass, set this to the number of threads you'd like to run
+    # if the CoverageProvider is multithreaded.
+    DEFAULT_WORKER_SIZE = 5
+
+    def __init__(self, _db, batch_size=None, cutoff_time=None,
+        multithreaded=False, worker_size=None
+    ):
         """Constructor.
 
-        :batch_size: The maximum number of objects that will be processed
+        :param batch_size: The maximum number of objects that will be processed
         at once.
 
         :param cutoff_time: Coverage records created before this time
         will be treated as though they did not exist.
+
+        :param multithreaded: Coverage will be processed through multiple
+        threads.
+
+        :param worker_size: In the case that coverage is multithreaded, this
+        dictates the number of workers. If self.multithreaded is set to False,
+        this attribute will be ignored.
         """
         self._db = _db
         if not self.__class__.SERVICE_NAME:
@@ -130,16 +164,21 @@ class BaseCoverageProvider(object):
             )
         service_name = self.__class__.SERVICE_NAME
         self.operation = self.get_operation()
-        
+
         if self.operation:
             service_name += ' (%s)' % self.operation
         self.service_name = service_name
+
         if not batch_size or batch_size < 0:
             batch_size = self.DEFAULT_BATCH_SIZE
         self.batch_size = batch_size
         self.cutoff_time = cutoff_time
+
+        self.multithreaded = multithreaded
+        worker_size = worker_size or self.DEFAULT_WORKER_SIZE
+
         self.collection_id = None
-        
+
     @property
     def log(self):
         if not hasattr(self, '_log'):
@@ -221,11 +260,11 @@ class BaseCoverageProvider(object):
             # increase the offset to ignore them, or they will
             # just show up again the next time we run this batch.
             offset += persistent_failures
-        
+
         return offset
 
     def process_batch_and_handle_results(self, batch):
-        """:return: A 2-tuple (counts, records). 
+        """:return: A 2-tuple (counts, records).
 
         `counts` is a 3-tuple (successes, transient failures,
         persistent_failures).
@@ -257,14 +296,14 @@ class BaseCoverageProvider(object):
                 record = self.record_failure_as_coverage_record(item)
                 if item.transient:
                     self.log.warn(
-                        "Transient failure covering %r: %s", 
+                        "Transient failure covering %r: %s",
                         item.obj, item.exception
                     )
                     record.status = BaseCoverageRecord.TRANSIENT_FAILURE
                     transient_failures += 1
                 else:
                     self.log.error(
-                        "Persistent failure covering %r: %s", 
+                        "Persistent failure covering %r: %s",
                         item.obj, item.exception
                     )
                     record.status = BaseCoverageRecord.PERSISTENT_FAILURE
@@ -314,6 +353,16 @@ class BaseCoverageProvider(object):
         :return: A mixed list of coverage records and CoverageFailures.
         """
         results = []
+        if self.multithreaded:
+            pool = WorkerPool(self.worker_size)
+            for item in batch:
+                job = CoverageJob(self, item, results)
+                pool.put(job)
+
+            pool.shutdown()
+            pool.wait()
+            return results
+
         for item in batch:
             result = self.process_item(item)
             if not isinstance(result, CoverageFailure):
