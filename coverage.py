@@ -95,8 +95,18 @@ class CoverageJob(Job):
         self.results = results
 
     def run(self):
-        result = self.provider.process_item(item)
-        self.results.append(result)
+        try:
+            result = self.provider.process_item(self.item)
+            self.results.append(result)
+        except Exception as e:
+            self.provider.log.error(
+                'Error running CoverageJob: %r', e, exc_info=e
+            )
+            failure = CoverageFailure(
+                self.item, str(e), self.provider.data_source,
+                collection=self.provider.collection
+            )
+            self.results.append(failure)
 
 
 class BaseCoverageProvider(object):
@@ -175,7 +185,7 @@ class BaseCoverageProvider(object):
         self.cutoff_time = cutoff_time
 
         self.multithreaded = multithreaded
-        worker_size = worker_size or self.DEFAULT_WORKER_SIZE
+        self.worker_size = worker_size or self.DEFAULT_WORKER_SIZE
 
         self.collection_id = None
 
@@ -361,13 +371,15 @@ class BaseCoverageProvider(object):
 
             pool.shutdown()
             pool.wait()
-            return results
+        else:
+            for item in batch:
+                result = self.process_item(item)
+                results.append(result)
 
-        for item in batch:
-            result = self.process_item(item)
+        for result in results:
             if not isinstance(result, CoverageFailure):
-                self.handle_success(item)
-            results.append(result)
+                self.handle_success(result)
+
         return results
 
     def add_coverage_records_for(self, items):
