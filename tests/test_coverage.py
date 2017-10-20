@@ -13,6 +13,7 @@ from testing import (
     AlwaysSuccessfulCollectionCoverageProvider,
     AlwaysSuccessfulCoverageProvider,
     AlwaysSuccessfulWorkCoverageProvider,
+    BrokenCoverageProvider,
     DummyHTTPClient,
     TaskIgnoringCoverageProvider,
     NeverSuccessfulBibliographicCoverageProvider,
@@ -57,6 +58,7 @@ from coverage import (
     CatalogCoverageProvider,
     CollectionCoverageProvider,
     CoverageFailure,
+    CoverageJob,
     IdentifierCoverageProvider,
 )
 
@@ -106,6 +108,42 @@ class TestCoverageFailure(DatabaseTest):
         )
         eq_(CoverageRecord.PERSISTENT_FAILURE, rec.status)
         eq_("Bah forever!", rec.exception)        
+
+
+class TestCoverageJob(DatabaseTest):
+
+    def test_run(self):
+        results = list()
+        identifier = self._identifier()
+        provider = AlwaysSuccessfulCoverageProvider(self._db)
+
+        CoverageJob(provider, identifier, results).run()
+
+        # The Identifier has been processed and put in a list.
+        eq_(1, len(results))
+        assert identifier in results
+
+        identifier = self._identifier()
+        provider = NeverSuccessfulCoverageProvider(self._db)
+        CoverageJob(provider, identifier, results).run()
+
+        # If a the result of processing is a CoverageFailure, the
+        # CoverageFailure is added to the results.
+        eq_(2, len(results))
+        result = results[-1]
+        assert isinstance(result, CoverageFailure)
+        eq_("What did you expect?", result.exception)
+
+        identifier = self._identifier()
+        provider = BrokenCoverageProvider(self._db)
+        CoverageJob(provider, identifier, results).run()
+
+        # If processing an item raises an error, a CoverageFailure is created
+        # and added to the results.
+        eq_(3, len(results))
+        result = results[-1]
+        assert isinstance(result, CoverageFailure)
+        eq_("I'm too broken to even return a CoverageFailure.", result.exception)
 
 
 class CoverageProviderTest(DatabaseTest):
@@ -394,6 +432,32 @@ class TestBaseCoverageProvider(CoverageProviderTest):
 
         Among other things, verify that handle_success is called.
         """
+        class HandlerCoverageProvider(AlwaysSuccessfulCoverageProvider):
+            def handle_success(self, item):
+                item.identifier = item.identifier + "+HANDLED"
+
+        singlethreaded_provider = HandlerCoverageProvider(self._db)
+        multithreaded_provider = HandlerCoverageProvider(
+            self._db, multithreaded=True, worker_size=3
+        )
+
+        singlethreaded_batch = list()
+        multithreaded_batch = list()
+        for batch in [singlethreaded_batch, multithreaded_batch]:
+            for i in range(10):
+                batch.append(self._identifier())
+
+        singlethreaded_results = singlethreaded_provider.process_batch(singlethreaded_batch)
+        multithreaded_results = multithreaded_provider.process_batch(multithreaded_batch)
+
+        # All of the identifiers have been processed.
+        eq_(singlethreaded_batch, singlethreaded_results)
+        eq_(multithreaded_batch, multithreaded_results)
+
+        # The handle_success method was called on all identifiers.
+        for batch in [multithreaded_batch, singlethreaded_batch]:
+            for identifier in batch:
+                assert identifier.identifier.endswith('+HANDLED')
 
     def test_should_update(self):
         """Verify that should_update gives the correct answer when we
