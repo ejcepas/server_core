@@ -1473,6 +1473,24 @@ class WorkClassificationScript(WorkPresentationScript):
     )
 
 
+class ReclassifyWorksForUncheckedSubjectsScript(WorkClassificationScript):
+    """Reclassify all Works whose current classifications appear to 
+    depend on Subjects in the 'unchecked' state.
+
+    This generally means that some migration script reset those
+    Subjects because the rules for processing them changed.
+    """
+
+    policy = WorkClassificationScript.policy
+
+    batch_size = 100
+
+    def __init__(self, _db=None):
+        if _db:
+            self._session = _db
+        self.query = Work.for_unchecked_subjects(self._db)
+
+
 class WorkOPDSScript(WorkPresentationScript):
     """Recalculate the OPDS entries and search index entries for Work objects.
 
@@ -2156,11 +2174,12 @@ class DatabaseMigrationInitializationScript(DatabaseMigrationScript):
 
         migrations = self.sort_migrations(self.fetch_migration_files()[0])
         py_migrations = filter(lambda m: m.endswith('.py'), migrations)
+        sql_migrations = filter(lambda m: m.endswith('.sql'), migrations)
 
-        most_recent_migration = migrations[-1]
+        most_recent_sql_migration = sql_migrations[-1]
         most_recent_python_migration = py_migrations[-1]
 
-        self.update_timestamps(most_recent_migration)
+        self.update_timestamps(most_recent_sql_migration)
         self.update_timestamps(most_recent_python_migration)
         self._db.commit()
 
@@ -2623,6 +2642,55 @@ class SubjectAssignmentScript(SubjectInputScript):
             self._db, args.subject_type, args.subject_filter
         )
         monitor.run()
+
+
+class ListCollectionMetadataIdentifiersScript(CollectionInputScript):
+    """List the metadata identifiers for Collections in the database.
+
+    This script is helpful for accounting for and tracking collections on
+    the metadata wrangler.
+    """
+    def __init__(self, _db=None, output=None):
+        _db = _db or self._db
+        super(ListCollectionMetadataIdentifiersScript, self).__init__(_db)
+        self.output = output or sys.stdout
+
+    def run(self, cmd_args=None):
+        parsed = self.parse_command_line(self._db, cmd_args=cmd_args)
+        self.do_run(parsed.collections)
+
+    def do_run(self, collections=None):
+        collection_ids = list()
+        if collections:
+            collection_ids = [c.id for c in collections]
+
+        collections = self._db.query(Collection).order_by(Collection.id)
+        if collection_ids:
+            collections = collections.filter(Collection.id.in_(collection_ids))
+
+        self.output.write('COLLECTIONS\n')
+        self.output.write('='*50+'\n')
+        def add_line(id, name, protocol, metadata_identifier):
+            line = '(%s) %s/%s => %s\n' % (
+                id, name, protocol, metadata_identifier
+            )
+            self.output.write(line)
+
+        count = 0
+        for collection in collections:
+            if not count:
+                # Add a format line.
+                add_line('id', 'name', 'protocol', 'metadata_identifier')
+
+            count += 1
+            add_line(
+                unicode(collection.id),
+                collection.name,
+                collection.protocol,
+                collection.metadata_identifier,
+            )
+
+        self.output.write('\n%d collections found.\n' % count)
 
 
 class MockStdin(object):

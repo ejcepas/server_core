@@ -26,6 +26,7 @@ from external_search import DummyExternalSearchIndex
 
 from model import (
     create,
+    dump_query,
     get_one,
     CachedFeed,
     Collection,
@@ -60,9 +61,11 @@ from scripts import (
     IdentifierInputScript,
     FixInvisibleWorksScript,
     LibraryInputScript,
+    ListCollectionMetadataIdentifiersScript,
     MockStdin,
     OPDSImportScript,
     PatronInputScript,
+    ReclassifyWorksForUncheckedSubjectsScript,
     RunCollectionMonitorScript,
     RunCoverageProviderScript,
     RunMonitorScript,
@@ -71,6 +74,7 @@ from scripts import (
     ShowCollectionsScript,
     ShowIntegrationsScript,
     ShowLibrariesScript,
+    WorkClassificationScript,
     WorkProcessingScript,
 )
 from testing import(
@@ -1088,40 +1092,56 @@ class TestDatabaseMigrationInitializationScript(DatabaseMigrationScriptTest):
         super(TestDatabaseMigrationInitializationScript, self).setup()
         self.script = DatabaseMigrationInitializationScript(self._db)
 
-    def assert_matches_latest_migration(self, timestamp, script=None, last_migration_date=None):
+    def assert_matches_latest_python_migration(self, timestamp, script=None):
         script = script or self.script
         migrations = script.fetch_migration_files()[0]
-        if not last_migration_date:
-            last_migration_date = script.sort_migrations(migrations)[-1][:8]
-        eq_(timestamp.timestamp.strftime('%Y%m%d'), last_migration_date)
+        migrations_sorted = script.sort_migrations(migrations)
+        last_migration_date = filter(lambda m: m.endswith('.py'), migrations_sorted)[-1][0:8]
+        self.assert_matches_timestamp(timestamp, last_migration_date)
+
+    def assert_matches_latest_migration(self, timestamp, script=None):
+        script = script or self.script
+        migrations = script.fetch_migration_files()[0]
+        migrations_sorted = script.sort_migrations(migrations)
+        py_migration = filter(lambda m: m.endswith('.py'), migrations_sorted)[-1][0:8]
+        sql_migration = filter(lambda m: m.endswith('.sql'), migrations_sorted)[-1][0:8]
+        last_migration_date = py_migration if int(py_migration) > int(sql_migration) else sql_migration
+        self.assert_matches_timestamp(timestamp, last_migration_date)
+
+    def assert_matches_timestamp(self, timestamp, migration_date):
+        eq_(timestamp.timestamp.strftime('%Y%m%d'), migration_date)
 
     def test_accurate_timestamps_created(self):
         eq_(None, Timestamp.value(self._db, self.script.name, collection=None))
-
         self.script.run()
         self.assert_matches_latest_migration(self.script.overall_timestamp)
-        self.assert_matches_latest_migration(self.script.python_timestamp)
+        self.assert_matches_latest_python_migration(self.script.python_timestamp)
 
-    def test_accurate_python_timestamp_craeted(self):
-        script = self.create_mock_script(
-            DatabaseMigrationInitializationScript, self._db
-        )
+    def test_accurate_python_timestamp_created_python_later(self):
+        script = self.create_mock_script(DatabaseMigrationInitializationScript, self._db)
         eq_(None, Timestamp.value(self._db, script.name, collection=None))
 
         # If the last python migration and the last SQL migration have
         # different timestamps, they're set accordingly.
-        self._create_test_migration_file(
-            self.core_migration_dir, 'CORE', 'sql', '20310101'
-        )
-        self._create_test_migration_file(
-            self.parent_migration_dir, 'SERVER', 'py', '20300101'
-        )
+        self._create_test_migration_file(self.core_migration_dir, 'CORE', 'sql', '20310101')
+        self._create_test_migration_file(self.parent_migration_dir, 'SERVER', 'py', '20300101')
 
         script.run()
-        self.assert_matches_latest_migration(script.overall_timestamp, script)
-        self.assert_matches_latest_migration(
-            script.python_timestamp, script, '20300101'
-        )
+        self.assert_matches_timestamp(script.overall_timestamp, '20310101')
+        self.assert_matches_timestamp(script.python_timestamp, '20300101')
+
+    def test_accurate_python_timestamp_created_python_earlier(self):
+        script = self.create_mock_script(DatabaseMigrationInitializationScript, self._db)
+        eq_(None, Timestamp.value(self._db, script.name, collection=None))
+
+        # If the last python migration and the last SQL migration have
+        # different timestamps, they're set accordingly.
+        self._create_test_migration_file(self.core_migration_dir, 'CORE', 'sql', '20310101')
+        self._create_test_migration_file(self.parent_migration_dir, 'SERVER', 'py', '20350101')
+
+        script.run()
+        self.assert_matches_timestamp(script.overall_timestamp, '20350101')
+        self.assert_matches_timestamp(script.python_timestamp, '20350101')
 
     def test_error_raised_when_timestamp_exists(self):
         Timestamp.stamp(self._db, self.script.name, None)
@@ -1132,7 +1152,7 @@ class TestDatabaseMigrationInitializationScript(DatabaseMigrationScriptTest):
         Timestamp.stamp(self._db, self.script.name, None, date=past)
         self.script.run(['-f'])
         self.assert_matches_latest_migration(self.script.overall_timestamp)
-        self.assert_matches_latest_migration(self.script.python_timestamp)
+        self.assert_matches_latest_python_migration(self.script.python_timestamp)
 
     def test_accepts_last_run_date(self):
         # A timestamp can be passed via the command line.
@@ -1141,7 +1161,6 @@ class TestDatabaseMigrationInitializationScript(DatabaseMigrationScriptTest):
         eq_(expected_stamp, self.script.overall_timestamp.timestamp)
 
         # It will override an existing timestamp if forced.
-        previous_timestamp = Timestamp.stamp(self._db, self.script.name, None)
         self.script.run(['--last-run-date', '20111111', '--force'])
         expected_stamp = datetime.datetime.strptime('20111111', '%Y%m%d')
         eq_(expected_stamp, self.script.overall_timestamp.timestamp)
@@ -2069,6 +2088,53 @@ class TestExplain(DatabaseTest):
         assert "%s owned" % pool.licenses_owned in output
         assert "Fulfillable" in output
         assert "ACTIVE" in output
+
+class TestReclassifyWorksForUncheckedSubjectsScript(DatabaseTest):
+
+    def test_constructor(self):
+        """Make sure that we're only going to classify works
+        with unchecked subjects.
+        """
+        script = ReclassifyWorksForUncheckedSubjectsScript(self._db)
+        eq_(WorkClassificationScript.policy, 
+            ReclassifyWorksForUncheckedSubjectsScript.policy)
+        eq_(100, script.batch_size)
+        eq_(dump_query(Work.for_unchecked_subjects(self._db)), 
+            dump_query(script.query))
+
+
+class TestListCollectionMetadataIdentifiersScript(DatabaseTest):
+
+    def test_do_run(self):
+        output = StringIO()
+        script = ListCollectionMetadataIdentifiersScript(
+            _db=self._db, output=output
+        )
+
+        # Create two collections.
+        c1 = self._collection(external_account_id=self._url)
+        c2 = self._collection(
+            name='Local Over', protocol=ExternalIntegration.OVERDRIVE,
+            external_account_id='banana'
+        )
+
+        script.do_run()
+
+        def expected(c):
+            return '(%s) %s/%s => %s\n' % (
+                unicode(c.id), c.name, c.protocol, c.metadata_identifier
+            )
+
+        # In the output, there's a header, a line describing the format,
+        # metdata identifiers for each collection, and a count of the
+        # collections found.
+        output = output.getvalue()
+        assert 'COLLECTIONS' in output
+        assert '(id) name/protocol => metadata_identifier\n' in output
+        assert expected(c1) in output
+        assert expected(c2) in output
+        assert '2 collections found.\n' in output
+
 
 class TestWorkConsolidationScript(object):
     """TODO"""

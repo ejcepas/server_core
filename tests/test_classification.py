@@ -15,7 +15,6 @@ from classifier import (
     Classifier,
     DeweyDecimalClassifier as DDC,
     LCCClassifier as LCC,
-    BISACClassifier as BISAC,
     BICClassifier as BIC,
     LCSHClassifier as LCSH,
     OverdriveClassifier as Overdrive,
@@ -30,11 +29,21 @@ from classifier import (
     WorkClassifier,
     fiction_genres,
     nonfiction_genres,
-    GenreData
+    GenreData,
     )
 
 genres = dict()
 GenreData.populate(globals(), genres, fiction_genres, nonfiction_genres)
+
+
+class TestGenreData(object):
+
+    def test_fiction_default(self):
+        # In general, genres are restricted to either fiction or
+        # nonfiction.
+        eq_(True, Science_Fiction.is_fiction)
+        eq_(False, Science.is_fiction)
+
 
 class TestClassifier(object):
 
@@ -95,6 +104,35 @@ class TestClassifier(object):
         eq_(17, u(14, "14+."))
         eq_(18, u(18, "18+"))
 
+
+    def test_scrub_identifier_can_override_name(self):
+        """Test the ability of scrub_identifier to override the name
+        of the subject for classification purposes.
+
+        This is used e.g. in the BISACClassifier to ensure that a known BISAC
+        code is always mapped to its canonical name.
+        """
+        class SetsNameForOneIdentifier(Classifier):
+            "A Classifier that insists on a certain name for one specific identifier"
+            @classmethod
+            def scrub_identifier(self, identifier):
+                if identifier == 'A':
+                    return ('A', 'Use this name!')
+                else:
+                    return identifier
+
+            @classmethod
+            def scrub_name(self, name):
+                """This verifies that the override name still gets passed
+                into scrub_name.
+                """
+                return name.upper()
+
+        m = SetsNameForOneIdentifier.scrub_identifier_and_name
+        eq_(("A", "USE THIS NAME!"), m("A", "name a"))
+        eq_(("B", "NAME B"), m("B", "name b"))
+
+
 class TestClassifierLookup(object):
 
     def test_lookup(self):
@@ -105,7 +143,6 @@ class TestClassifierLookup(object):
         eq_(GradeLevelClassifier, Classifier.lookup(Classifier.GRADE_LEVEL))
         eq_(AgeClassifier, Classifier.lookup(Classifier.AGE_RANGE))
         eq_(InterestLevelClassifier, Classifier.lookup(Classifier.INTEREST_LEVEL))
-        eq_(Overdrive, Classifier.lookup(Classifier.OVERDRIVE))
         eq_(None, Classifier.lookup('no-such-key'))
 
 class TestTargetAge(object):
@@ -532,84 +569,13 @@ class TestKeyword(object):
         # particular.
         eq_(classifier.Historical_Fiction, Keyword.genre(None, "Historical"))
         eq_(None, Keyword.genre(None, "Historicals"))
+
+        # The Fiction/Urban classification is different from the
+        # African-American-focused "Urban Fiction" classification.
+        eq_(None, Keyword.genre(None, "Fiction/Urban"))
+
+        eq_(classifier.Folklore, Keyword.genre(None, "fables"))
         
-class TestBISAC(object):
-
-    def test_is_fiction(self):
-        def fic(bisac):
-            return BISAC.is_fiction(BISAC.scrub_identifier(bisac), None)
-
-        eq_(True, fic("FICTION / Classics"))
-        eq_(True, fic("JUVENILE FICTION / Concepts / Date & Time"))
-        eq_(True, fic("YOUNG ADULT FICTION / Lifestyles / Country Life"))
-        eq_(False, fic("HISTORY / General"))
-
-
-    def test_audience(self):
-
-        young_adult = Classifier.AUDIENCE_YOUNG_ADULT
-        adult = Classifier.AUDIENCE_ADULT
-        children = Classifier.AUDIENCE_CHILDREN
-        def aud(bisac):
-            return BISAC.audience(BISAC.scrub_identifier(bisac), None)
-            
-        eq_(adult, aud("FAMILY & RELATIONSHIPS / Love & Romance"))
-        eq_(children, aud("JUVENILE FICTION / Action & Adventure / General"))
-        eq_(young_adult, aud("YOUNG ADULT FICTION / Action & Adventure / General"))
-
-    def test_default_age_range_for_audience(self):
-        class DummySubject(object):
-            def __init__(self, x):
-                self.identifier = x
-                self.name = None
-
-        def target(bisac):
-            dummy = DummySubject(bisac)
-            return BISAC.classify(dummy)[2]
-        
-        eq_((None, None), target("JUVENILE FICTION / Action & Adventure / General"))
-        eq_((14,17), target("YOUNG ADULT FICTION / Action & Adventure / General"))
-        eq_((18, None), target("Erotica / General"))
-
-    def test_genre(self):
-        def gen(bisac):
-            return BISAC.genre(BISAC.scrub_identifier(bisac), None)
-        eq_(classifier.Adventure, 
-            gen("JUVENILE FICTION / Action & Adventure / General"))
-        eq_(classifier.Erotica, gen("FICTION / Erotica"))
-        eq_(classifier.Religion_Spirituality, 
-            gen("RELIGION / Biblical Studies / Prophecy"))
-
-        eq_(classifier.Dystopian_SF,
-            gen("JUVENILE FICTION / Dystopian")
-        )
-
-        eq_(classifier.Folklore,
-            gen("JUVENILE FICTION / Fairy Tales & Folklore / General")
-        )
-
-        eq_(classifier.Folklore,
-            gen("JUVENILE FICTION / Legends, Myths, Fables / General")
-        )
-
-        eq_(classifier.Life_Strategies, 
-            gen("JUVENILE NONFICTION / Social Issues / Friendship")
-        )
-
-        eq_(classifier.Poetry, 
-            gen("JUVENILE FICTION / Stories in Verse (see also Poetry)")
-        )
-
-        eq_(classifier.Poetry, 
-            gen("JUVENILE NONFICTION / Poetry / Humorous")
-        )
-
-        eq_(classifier.Poetry, 
-            gen("YOUNG ADULT NONFICTION / Poetry")
-        )
-
-        eq_(classifier.Folklore, 
-            gen("Fables/Arthurian/"))
 
 class TestBIC(object):
 
@@ -756,30 +722,6 @@ class TestConsolidateWeights(object):
         eq_(100, w2[classifier.History])
         eq_(1, w2[classifier.Middle_East_History])
 
-
-class TestOverdriveClassifier(object):
-
-    def test_foreign_languages(self):
-        eq_("Foreign Language Study", 
-            Overdrive.scrub_identifier("Foreign Language Study - Italian"))
-
-    def test_target_age(self):
-        def a(x, y):
-            return Overdrive.target_age(x,y)
-        eq_((0,4), a("Picture Book Nonfiction", None))
-        eq_((5,8), a("Beginning Reader", None))
-        eq_((12,17), a("Young Adult Fiction", None))
-        eq_((None,None), a("Fiction", None))
-
-    def test_audience(self):
-        def a(identifier):
-            return Overdrive.audience(identifier, None)
-        eq_(Classifier.AUDIENCE_CHILDREN, a("Picture Books"))
-        eq_(Classifier.AUDIENCE_CHILDREN, a("Beginning Reader"))
-        eq_(Classifier.AUDIENCE_CHILDREN, a("Children's Video"))
-        eq_(Classifier.AUDIENCE_CHILDREN, a("Juvenile Nonfiction"))
-        eq_(Classifier.AUDIENCE_YOUNG_ADULT, a("Young Adult Nonfiction"))
-        eq_(Classifier.AUDIENCE_ADULTS_ONLY, a("Erotic Literature"))
 
 class TestSimplifiedGenreClassifier(object):
 
@@ -972,15 +914,12 @@ class TestWorkClassifier(DatabaseTest):
 
     def test_juvenile_classification_is_split_between_children_and_ya(self):
 
-        # 3M files both children's and YA works under 'JUVENILE FICTION'.
+        # LCC files both children's and YA works under 'PZ'.
         # Here's how we deal with that.
         #
         i = self.identifier
-        source = DataSource.lookup(self._db, DataSource.THREEM)
-        c = i.classify(
-            source, Subject.THREEM, "JUVENILE FICTION/Historical/Africa/", 
-            weight=100
-        )
+        source = DataSource.lookup(self._db, DataSource.OCLC)
+        c = i.classify(source, Subject.LCC, "PZ", weight=100)
         self.classifier.add(c)
 
         # (This classification has no bearing on audience and its

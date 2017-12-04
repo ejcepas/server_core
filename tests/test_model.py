@@ -2,6 +2,7 @@
 from StringIO import StringIO
 import base64
 import datetime
+import feedparser
 import os
 import sys
 import site
@@ -31,16 +32,20 @@ from sqlalchemy.orm.exc import (
 )
 from sqlalchemy.orm.session import Session
 
+from lxml import etree
+
 from config import (
     Configuration, 
     temp_config,
 )
 
+import lane
 import model
 from model import (
     Admin,
     Annotation,
     BaseCoverageRecord,
+    CachedFeed,
     CirculationEvent,
     Classification,
     Collection,
@@ -84,6 +89,7 @@ from model import (
     get_one,
     get_one_or_create,
     site_configuration_has_changed,
+    tuple_to_numericrange,
 )
 from external_search import (
     DummyExternalSearchIndex,
@@ -336,6 +342,39 @@ class TestIdentifier(DatabaseTest):
         # All other identifiers use our custom URN scheme.
         identifier = self._identifier(Identifier.OVERDRIVE_ID)
         assert identifier.urn.startswith(Identifier.URN_SCHEME_PREFIX)
+
+    def test_parse_urns(self):
+        identifier = self._identifier()
+        fake_urn = "what_even_is_this"
+        new_urn = Identifier.URN_SCHEME_PREFIX + "Overdrive%20ID/nosuchidentifier"
+        # Also create a different URN that would result in the same identifier.
+        same_new_urn = Identifier.URN_SCHEME_PREFIX + "Overdrive%20ID/NOSUCHidentifier"
+        urns = [identifier.urn, fake_urn, new_urn, same_new_urn]
+
+        results = Identifier.parse_urns(self._db, urns)
+        identifiers_by_urn, failures = results
+
+        # The fake URN is returned in the list of failures.
+        eq_(failures, [fake_urn])
+
+        eq_(2, len(identifiers_by_urn))
+        # The existing identifier is returned from its URN.
+        eq_(identifier, identifiers_by_urn[identifier.urn])
+
+        new_identifier = identifiers_by_urn[new_urn]
+        assert isinstance(new_identifier, Identifier)
+        assert new_identifier in self._db
+        eq_(Identifier.OVERDRIVE_ID, new_identifier.type)
+        eq_("nosuchidentifier", new_identifier.identifier)
+
+        # It also works if we ask only for identifiers that already exist.
+        urns = [identifier.urn]
+        [results, errors] = Identifier.parse_urns(self._db, urns)
+
+        # We got no errors and one successful lookup.
+        eq_([], errors)
+        eq_(1, len(results))
+        eq_(identifier, results[identifier.urn])
 
     def test_parse_urn(self):
 
@@ -617,6 +656,37 @@ class TestIdentifier(DatabaseTest):
                 self._db, [Identifier.GUTENBERG_ID], web)])
         )
 
+    def test_missing_coverage_from_with_collection(self):
+        gutenberg = DataSource.lookup(self._db, DataSource.GUTENBERG)
+        identifier = self._identifier()
+        collection1 = self._default_collection
+        collection2 = self._collection()
+        self._coverage_record(identifier, gutenberg, collection=collection1)
+
+        # The Identifier has coverage in collection 1.
+        eq_([], 
+            Identifier.missing_coverage_from(
+                self._db, [identifier.type], gutenberg, collection=collection1
+            ).all()
+        )
+
+        # It is missing coverage in collection 2.
+        eq_(
+            [identifier], Identifier.missing_coverage_from(
+                self._db, [identifier.type], gutenberg, collection=collection2
+            ).all()
+        )
+
+        # If no collection is specified, we look for a CoverageRecord
+        # that also has no collection specified, and the Identifier is
+        # not treated as covered.
+        eq_([identifier], 
+            Identifier.missing_coverage_from(
+                self._db, [identifier.type], gutenberg
+            ).all()
+        )
+
+
     def test_missing_coverage_from_with_cutoff_date(self):
         gutenberg = DataSource.lookup(self._db, DataSource.GUTENBERG)
         oclc = DataSource.lookup(self._db, DataSource.OCLC)
@@ -651,6 +721,61 @@ class TestIdentifier(DatabaseTest):
                 count_as_missing_before=timestamp+datetime.timedelta(seconds=1)
             ).all()
         )
+
+    def test_opds_entry(self):
+        identifier = self._identifier()
+        source = DataSource.lookup(self._db, DataSource.CONTENT_CAFE)
+
+        summary = identifier.add_link(
+            Hyperlink.DESCRIPTION, 'http://description', source,
+            media_type=Representation.TEXT_PLAIN, content='a book'
+        )[0]
+        cover = identifier.add_link(
+            Hyperlink.IMAGE, 'http://cover', source,
+            media_type=Representation.JPEG_MEDIA_TYPE
+        )[0]
+
+        def get_entry_dict(entry):
+            return feedparser.parse(unicode(etree.tostring(entry))).entries[0]
+
+        def format_timestamp(timestamp):
+            return timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        # The entry includes the urn, description, and cover link.
+        entry = get_entry_dict(identifier.opds_entry())
+        eq_(identifier.urn, entry.id)
+        eq_('a book', entry.summary)
+        [cover_link] = entry.links
+        eq_('http://cover', cover_link.href)
+
+        # Its updated time is set to the cover representation time.
+        expected = cover.resource.representation.mirrored_at
+        eq_(format_timestamp(expected), entry.updated)
+
+        # If a coverage record is dated after the representation time,
+        # That becomes the new updated time.
+        record = self._coverage_record(identifier, source)
+        entry = get_entry_dict(identifier.opds_entry())
+        eq_(format_timestamp(record.timestamp), entry.updated)
+
+        # Basically the latest date is taken from either a coverage record
+        # or a representation.
+        thumbnail = identifier.add_link(
+            Hyperlink.THUMBNAIL_IMAGE, 'http://thumb', source,
+            media_type=Representation.JPEG_MEDIA_TYPE
+        )[0]
+        thumb_rep = thumbnail.resource.representation
+        cover_rep = cover.resource.representation
+        thumbnail.resource.representation.thumbnail_of_id = cover_rep.id
+        cover_rep.thumbnails.append(thumb_rep)
+
+        entry = get_entry_dict(identifier.opds_entry())
+        # The thumbnail has been added to the links.
+        eq_(2, len(entry.links))
+        assert any(filter(lambda l: l.href=='http://thumb', entry.links))
+        # And the updated time has been changed accordingly.
+        expected = thumbnail.resource.representation.mirrored_at
+        eq_(format_timestamp(expected), entry.updated)
 
 
 class TestGenre(DatabaseTest):
@@ -2375,7 +2500,7 @@ class TestWork(DatabaseTest):
         edition3.add_contributor(bob, Contributor.AUTHOR_ROLE)
         edition3.add_contributor(alice, Contributor.AUTHOR_ROLE)
 
-        work = self._work(presentation_edition=edition2)
+        work = self._slow_work(presentation_edition=edition2)
         # add in 3, 2, 1 order to make sure the selection of edition1 as presentation
         # in the second half of the test is based on business logic, not list order.
         for p in pool3, pool1:
@@ -2962,10 +3087,10 @@ class TestWork(DatabaseTest):
         # Add some classifications.
 
         # This classification has no subject name, so the search document will use the subject identifier.
-        edition.primary_identifier.classify(data_source, Subject.THREEM, "FICTION/Science Fiction/Time Travel", None, 6)
+        edition.primary_identifier.classify(data_source, Subject.BISAC, "FICTION/Science Fiction/Time Travel", None, 6)
 
         # This one has the same subject type and identifier, so their weights will be combined.
-        identifier.classify(data_source, Subject.THREEM, "FICTION/Science Fiction/Time Travel", None, 1)
+        identifier.classify(data_source, Subject.BISAC, "FICTION/Science Fiction/Time Travel", None, 1)
 
         # Here's another classification with a different subject type.
         edition.primary_identifier.classify(data_source, Subject.OVERDRIVE, "Romance", None, 2)
@@ -3039,7 +3164,7 @@ class TestWork(DatabaseTest):
 
         classifications = search_doc['classifications']
         eq_(3, len(classifications))
-        [classification1_doc] = [c for c in classifications if c['scheme'] == Subject.uri_lookup[Subject.THREEM]]
+        [classification1_doc] = [c for c in classifications if c['scheme'] == Subject.uri_lookup[Subject.BISAC]]
         [classification2_doc] = [c for c in classifications if c['scheme'] == Subject.uri_lookup[Subject.OVERDRIVE]]
         [classification3_doc] = [c for c in classifications if c['scheme'] == Subject.uri_lookup[Subject.FAST]]
         eq_("FICTION Science Fiction Time Travel", classification1_doc['term'])
@@ -3197,7 +3322,34 @@ class TestWork(DatabaseTest):
         # The work was not added to the search index -- that happens
         # later, when the WorkCoverageRecord is processed.
         eq_([], index.docs.values())
-        
+      
+
+    def test_for_unchecked_subjects(self):
+
+        w1 = self._work(with_license_pool=True)
+        w2 = self._work()
+        identifier = w1.license_pools[0].identifier
+
+        # Neither of these works is associated with any subjects, so
+        # they're not associated with any unchecked subjects.
+        qu = Work.for_unchecked_subjects(self._db)
+        eq_([], qu.all())
+
+        # These Subjects haven't been checked, so the Work associated with
+        # them shows up.
+        ds = DataSource.lookup(self._db, DataSource.OVERDRIVE)
+        classification = identifier.classify(ds, Subject.TAG, "some tag")
+        classification2 = identifier.classify(ds, Subject.TAG, "another tag")
+        eq_([w1], qu.all())
+
+        # If one of them is checked, the Work still shows up.
+        classification.subject.checked = True
+        eq_([w1], qu.all())
+
+        # Only when all Subjects are checked does the work stop showing up.
+        classification2.subject.checked = True
+        eq_([], qu.all())
+
 
 class TestCirculationEvent(DatabaseTest):
 
@@ -4482,11 +4634,13 @@ class TestRepresentation(DatabaseTest):
         m = Representation.guess_media_type
 
         eq_(Representation.JPEG_MEDIA_TYPE, m("file.jpg"))
+        eq_(Representation.ZIP_MEDIA_TYPE, m("file.ZIP"))
 
         for extension, media_type in Representation.MEDIA_TYPE_FOR_EXTENSION.items():
             filename = "file" + extension
             eq_(media_type, m(filename))
 
+        eq_(None, m(None))
         eq_(None, m("file"))
         eq_(None, m("file.unknown-extension"))
 
@@ -5682,19 +5836,43 @@ class TestCoverageRecord(DatabaseTest):
         source = DataSource.lookup(self._db, DataSource.OCLC)
         edition = self._edition()
         operation = 'foo'
-        record = self._coverage_record(edition, source, operation)
+        collection = self._default_collection
+        record = self._coverage_record(edition, source, operation, 
+                                       collection=collection)
 
-        lookup = CoverageRecord.lookup(edition, source, operation)
+
+        # To find the CoverageRecord, edition, source, operation,
+        # and collection must all match.
+        result = CoverageRecord.lookup(edition, source, operation, 
+                                       collection=collection)
+        eq_(record, result)
+
+        # You can substitute the Edition's primary identifier for the
+        # Edition iteslf.
+        lookup = CoverageRecord.lookup(
+            edition.primary_identifier, source, operation, 
+            collection=self._default_collection
+        )
         eq_(lookup, record)
 
-        lookup = CoverageRecord.lookup(edition, source)
-        eq_(None, lookup)
 
-        lookup = CoverageRecord.lookup(edition.primary_identifier, source, operation)
-        eq_(lookup, record)
+        # Omit the collection, and you find nothing.
+        result = CoverageRecord.lookup(edition, source, operation)
+        eq_(None, result)
 
-        lookup = CoverageRecord.lookup(edition.primary_identifier, source)
-        eq_(None, lookup)
+        # Same for operation.
+        result = CoverageRecord.lookup(edition, source, collection=collection)
+        eq_(None, result)
+
+        result = CoverageRecord.lookup(edition, source, "other operation",
+                                       collection=collection)
+        eq_(None, result)
+
+        # Same for data source.
+        other_source = DataSource.lookup(self._db, DataSource.OVERDRIVE)
+        result = CoverageRecord.lookup(edition, other_source, operation,
+                                       collection=collection)
+        eq_(None, result)
 
     def test_add_for(self):
         source = DataSource.lookup(self._db, DataSource.OCLC)
@@ -6811,6 +6989,9 @@ class TestSiteConfigurationHasChanged(DatabaseTest):
             "Assert that `was_called` is True, then reset it for the next assertion."
             assert self.was_called
             self.was_called = False
+
+        def assert_was_not_called(self):
+            assert not self.was_called
             
     def setup(self):
         super(TestSiteConfigurationHasChanged, self).setup()
@@ -6818,11 +6999,13 @@ class TestSiteConfigurationHasChanged(DatabaseTest):
         # Mock model.site_configuration_has_changed
         self.old_site_configuration_has_changed = model.site_configuration_has_changed
         self.mock = self.MockSiteConfigurationHasChanged()
-        model.site_configuration_has_changed = self.mock.run
+        for module in model, lane:
+            module.site_configuration_has_changed = self.mock.run
 
     def teardown(self):
         super(TestSiteConfigurationHasChanged, self).teardown()
-        model.site_configuration_has_changed = self.old_site_configuration_has_changed
+        for module in model, lane:
+            module.site_configuration_has_changed = self.old_site_configuration_has_changed
         
     def test_site_configuration_has_changed(self):
         """Test the site_configuration_has_changed() function and its
@@ -6917,22 +7100,42 @@ class TestSiteConfigurationHasChanged(DatabaseTest):
         ConfigurationSetting.sitewide(self._db, "setting").value = "value2"
         self.mock.assert_was_called()
 
+    def test_lane_change_updates_configuration(self):
+        """Verify that configuration-relevant changes work the same way
+        in the lane module as they do in the model module.
+        """
+        lane = self._lane()
+        self.mock.assert_was_called()
+        
+        lane.add_genre("Science Fiction")
+        self.mock.assert_was_called()
+
     def test_configuration_relevant_collection_change_updates_configuration(self):
         """When you add a relevant item to a SQLAlchemy collection, such as
         adding a Collection to library.collections,
         site_configuration_has_changed is called.
         """                
 
-        # Creating a library calls the method.
+        # Creating a collection calls the method via an 'after_insert'
+        # event on Collection.
         library = self._default_library
         collection = self._collection()
+        self._db.commit()
         self.mock.assert_was_called()
-        
-        # Add the collection to the library, and
-        # site_configuration_has_changed() is called.
+
+        # Adding the collection to the library calls the method via
+        # an 'append' event on Collection.libraries.
         library.collections.append(collection)
+        self._db.commit()
         self.mock.assert_was_called()
-        
+
+        # Associating a CachedFeed with the library does _not_ call
+        # the method, because nothing changed on the Library object and
+        # we don't listen for 'append' events on Library.cachedfeeds.
+        create(self._db, CachedFeed, type='page', pagination='', 
+               facets='', library=library)
+        self._db.commit()
+        self.mock.assert_was_not_called()
     
 class TestCollection(DatabaseTest):
 
@@ -7104,6 +7307,53 @@ class TestCollection(DatabaseTest):
         opds.data_source = None
         eq_(None, opds.data_source)
 
+    def test_default_loan_period(self):
+        library = self._default_library
+        library.collections.append(self.collection)
+
+        ebook = Edition.BOOK_MEDIUM
+        audio = Edition.AUDIO_MEDIUM
+
+        # The default when no value is set.
+        eq_(
+            Collection.STANDARD_DEFAULT_LOAN_PERIOD, 
+            self.collection.default_loan_period(library, ebook)
+        )
+
+        eq_(
+            Collection.STANDARD_DEFAULT_LOAN_PERIOD, 
+            self.collection.default_loan_period(library, audio)
+        )
+
+        # Set a value, and it's used.
+        self.collection.default_loan_period_setting(library, ebook).value = 604
+        eq_(604, self.collection.default_loan_period(library))
+        eq_(
+            Collection.STANDARD_DEFAULT_LOAN_PERIOD, 
+            self.collection.default_loan_period(library, audio)
+        )
+
+        self.collection.default_loan_period_setting(library, audio).value = 606
+        eq_(606, self.collection.default_loan_period(library, audio))
+
+    def test_default_reservation_period(self):
+        library = self._default_library
+        # The default when no value is set.
+        eq_(
+            Collection.STANDARD_DEFAULT_RESERVATION_PERIOD, 
+            self.collection.default_reservation_period
+        )
+
+        # Set a value, and it's used.
+        self.collection.default_reservation_period = 601
+        eq_(601, self.collection.default_reservation_period)
+
+        # The underlying value is controlled by a ConfigurationSetting.
+        self.collection.external_integration.setting(
+            Collection.DEFAULT_RESERVATION_PERIOD_KEY
+        ).value = 954
+        eq_(954, self.collection.default_reservation_period)
+
     def test_explain(self):
         """Test that Collection.explain gives all relevant information
         about a Collection.
@@ -7219,32 +7469,101 @@ class TestCollection(DatabaseTest):
     def test_catalog_identifier(self):
         """#catalog_identifier associates an identifier with the catalog"""
         identifier = self._identifier()
-        self.collection.catalog_identifier(self._db, identifier)
+        self.collection.catalog_identifier(identifier)
 
         eq_(1, len(self.collection.catalog))
         eq_(identifier, self.collection.catalog[0])
+
+    def test_catalog_identifiers(self):
+        """#catalog_identifier associates multiple identifiers with a catalog"""
+        i1 = self._identifier()
+        i2 = self._identifier()
+        i3 = self._identifier()
+
+        # One of the identifiers is already in the catalog.
+        self.collection.catalog_identifier(i3)
+
+        self.collection.catalog_identifiers([i1, i2, i3])
+
+        # Now all three identifiers are in the catalog.
+        assert sorted([i1, i2, i3]) == sorted(self.collection.catalog)
 
     def test_works_updated_since(self):
         w1 = self._work(with_license_pool=True)
         w2 = self._work(with_license_pool=True)
         w3 = self._work(with_license_pool=True)
-        timestamp = datetime.datetime.utcnow()
+
         # An empty catalog returns nothing.
+        timestamp = datetime.datetime.utcnow()
         eq_([], self.collection.works_updated_since(self._db, timestamp).all())
 
-        # When no timestamp is passed, all works in the catalog are returned.
-        self.collection.catalog_identifier(self._db, w1.license_pools[0].identifier)
-        self.collection.catalog_identifier(self._db, w2.license_pools[0].identifier)
-        updated_works = self.collection.works_updated_since(self._db, None).all()
+        self.collection.catalog_identifier(w1.license_pools[0].identifier)
+        self.collection.catalog_identifier(w2.license_pools[0].identifier)
 
-        eq_(2, len(updated_works))
-        assert w1 in updated_works and w2 in updated_works
-        assert w3 not in updated_works
+        # When no timestamp is passed, all works in the catalog are returned.
+        # in order of their WorkCoverageRecord timestamp.
+        updated_works = self.collection.works_updated_since(self._db, None).all()
+        eq_([w1, w2], updated_works)
 
         # When a timestamp is passed, only works that have been updated
         # since then will be returned
-        w1.coverage_records[0].timestamp = datetime.datetime.utcnow()
+        [w1_coverage_record] = [
+            c for c in w1.coverage_records
+            if c.operation == WorkCoverageRecord.GENERATE_OPDS_OPERATION
+        ]
+        w1_coverage_record.timestamp = datetime.datetime.utcnow()
         eq_([w1], self.collection.works_updated_since(self._db, timestamp).all())
+
+    def test_isbns_updated_since(self):
+        i1 = self._identifier(identifier_type=Identifier.ISBN, foreign_id=self._isbn)
+        i2 = self._identifier(identifier_type=Identifier.ISBN, foreign_id=self._isbn)
+        i3 = self._identifier(identifier_type=Identifier.ISBN, foreign_id=self._isbn)
+        i4 = self._identifier(identifier_type=Identifier.ISBN, foreign_id=self._isbn)
+
+        timestamp = datetime.datetime.utcnow()
+
+        # An empty catalog returns nothing..
+        eq_([], self.collection.isbns_updated_since(self._db, None).all())
+
+        # Give the ISBNs some coverage.
+        content_cafe = DataSource.lookup(self._db, DataSource.CONTENT_CAFE)
+        for isbn in [i2, i3, i1]:
+            self._coverage_record(isbn, content_cafe)
+
+        # Give one ISBN more than one coverage record.
+        oclc = DataSource.lookup(self._db, DataSource.OCLC)
+        i1_oclc_record = self._coverage_record(i1, oclc)
+
+        def assert_isbns(expected, result_query):
+            results = [r[0] for r in result_query]
+            eq_(expected, results)
+
+        # When no timestamp is given, all ISBNs in the catalog are returned,
+        # in order of their CoverageRecord timestamp.
+        self.collection.catalog_identifiers([i1, i2])
+        updated_isbns = self.collection.isbns_updated_since(self._db, None).all()
+        assert_isbns([i2, i1], updated_isbns)
+
+        # That CoverageRecord timestamp is also returned.
+        i1_timestamp = updated_isbns[1][1]
+        assert isinstance(i1_timestamp, datetime.datetime)
+        eq_(i1_oclc_record.timestamp, i1_timestamp)
+
+        # When a timestamp is passed, only works that have been updated since
+        # then will be returned.
+        timestamp = datetime.datetime.utcnow()
+        i1.coverage_records[0].timestamp = datetime.datetime.utcnow()
+        updated_isbns = self.collection.isbns_updated_since(self._db, timestamp)
+        assert_isbns([i1], updated_isbns)
+
+        # Prepare an ISBN associated with a Work.
+        work = self._work(with_license_pool=True)
+        work.license_pools[0].identifier = i2
+        i2.coverage_records[0].timestamp = datetime.datetime.utcnow()
+
+        # ISBNs that have a Work will be ignored.
+        updated_isbns = self.collection.isbns_updated_since(self._db, timestamp)
+        assert_isbns([i1], updated_isbns)
 
 
 class TestCollectionForMetadataWrangler(DatabaseTest):
@@ -7460,6 +7779,33 @@ class TestAdmin(DatabaseTest):
         eq_(self.admin, Admin.authenticate(self._db, "admin@nypl.org", "password"))
         eq_(None, Admin.authenticate(self._db, "other@nypl.org", "password"))
         eq_(None, Admin.authenticate(self._db, "example@nypl.org", "password"))
+
+
+class TestTupleToNumericrange(object):
+    """Test the tuple_to_numericrange helper function."""
+
+    def test_tuple_to_numericrange(self):
+        f = tuple_to_numericrange
+        eq_(None, f(None))
+
+        one_to_ten = f((1,10))
+        assert isinstance(one_to_ten, NumericRange)
+        eq_(1, one_to_ten.lower)
+        eq_(10, one_to_ten.upper)
+        eq_(True, one_to_ten.upper_inc)
+
+        up_to_ten = f((None, 10))
+        assert isinstance(up_to_ten, NumericRange)
+        eq_(None, up_to_ten.lower)
+        eq_(10, up_to_ten.upper)
+        eq_(True, up_to_ten.upper_inc)
+
+        ten_and_up = f((10,None))
+        assert isinstance(ten_and_up, NumericRange)
+        eq_(10, ten_and_up.lower)
+        eq_(None, ten_and_up.upper)
+        eq_(False, ten_and_up.upper_inc)
+
 
 
 class MockHasTableCache(HasFullTableCache):

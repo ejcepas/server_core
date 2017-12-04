@@ -49,6 +49,7 @@ from sqlalchemy.orm import (
     contains_eager,
     joinedload,
     lazyload,
+    mapper,
     relationship,
     sessionmaker,
     synonym,
@@ -794,6 +795,9 @@ class Loan(Base, LoanAndHoldMixin):
     fulfillment_id = Column(Integer, ForeignKey('licensepooldeliveries.id'))
     start = Column(DateTime)
     end = Column(DateTime)
+    # Some distributors (e.g. Feedbooks) may have an identifier that can
+    # be used to check the status of a specific Loan.
+    external_identifier = Column(Unicode, unique=True, nullable=True)
 
     __table_args__ = (
         UniqueConstraint('patron_id', 'license_pool_id'),
@@ -1198,6 +1202,7 @@ class DataSource(Base, HasFullTableCache):
                 (cls.GUTENBERG, True, False, Identifier.GUTENBERG_ID, None),
                 (cls.RB_DIGITAL, True, True, Identifier.RB_DIGITAL_ID, None),
                 (cls.OVERDRIVE, True, False, Identifier.OVERDRIVE_ID, 0),
+                (cls.BIBLIOTHECA, True, False, Identifier.BIBLIOTHECA_ID, 60*60*6),
                 (cls.ODILO, True, False, Identifier.ODILO_ID, 0),
                 (cls.THREEM, True, False, Identifier.BIBLIOTHECA_ID, 60*60*6),
                 (cls.AXIS_360, True, False, Identifier.AXIS_360_ID, 0),
@@ -1308,7 +1313,6 @@ class CoverageRecord(Base, BaseCoverageRecord):
 
     SET_EDITION_METADATA_OPERATION = u'set-edition-metadata'
     CHOOSE_COVER_OPERATION = u'choose-cover'
-    SYNC_OPERATION = u'sync'
     REAP_OPERATION = u'reap'
     IMPORT_OPERATION = u'import'
     RESOLVE_IDENTIFIER_OPERATION = u'resolve-identifier'
@@ -1370,7 +1374,8 @@ class CoverageRecord(Base, BaseCoverageRecord):
         )
 
     @classmethod
-    def lookup(self, edition_or_identifier, data_source, operation=None):
+    def lookup(cls, edition_or_identifier, data_source, operation=None,
+               collection=None):
         _db = Session.object_session(edition_or_identifier)
         if isinstance(edition_or_identifier, Identifier):
             identifier = edition_or_identifier
@@ -1379,11 +1384,16 @@ class CoverageRecord(Base, BaseCoverageRecord):
         else:
             raise ValueError(
                 "Cannot look up a coverage record for %r." % edition) 
+
+        if isinstance(data_source, basestring):
+            data_source = DataSource.lookup(_db, data_source)
+
         return get_one(
             _db, CoverageRecord,
             identifier=identifier,
             data_source=data_source,
             operation=operation,
+            collection=collection,
             on_multiple='interchangeable',
         )
 
@@ -1431,8 +1441,7 @@ class WorkCoverageRecord(Base, BaseCoverageRecord):
     UPDATE_SEARCH_INDEX_OPERATION = u'update-search-index'
 
     id = Column(Integer, primary_key=True)
-    work_id = Column(
-        Integer, ForeignKey('works.id'), index=True)
+    work_id = Column(Integer, ForeignKey('works.id'), index=True)
     operation = Column(String(255), index=True, default=None)
         
     timestamp = Column(DateTime, index=True)
@@ -1518,9 +1527,8 @@ class WorkCoverageRecord(Base, BaseCoverageRecord):
         # The SELECT part of the INSERT...SELECT query.
         new_records = _db.query(
             Work.id.label('work_id'), 
-            literal(operation, type_=BaseCoverageRecord.status_enum).label('operation'),
-            literal(timestamp, type_=DateTime).label('timestamp'), 
-
+            literal(operation, type_=String(255)).label('operation'),
+            literal(timestamp, type_=DateTime).label('timestamp'),
             literal(status, type_=BaseCoverageRecord.status_enum).label('status')
         ).select_from(
             Work
@@ -1737,25 +1745,12 @@ class Identifier(Base):
     def for_foreign_id(cls, _db, foreign_identifier_type, foreign_id,
                        autocreate=True):
         """Turn a foreign ID into an Identifier."""
+        foreign_identifier_type, foreign_id = cls.prepare_foreign_type_and_identifier(
+            foreign_identifier_type, foreign_id
+        )
         if not foreign_identifier_type or not foreign_id:
             return None
 
-        # Turn a deprecated identifier type (e.g. "3M ID" into the
-        # current type (e.g. "Bibliotheca ID").
-        foreign_identifier_type = cls.DEPRECATED_NAMES.get(
-            foreign_identifier_type, foreign_identifier_type
-        )
-        
-        if foreign_identifier_type in (
-                Identifier.OVERDRIVE_ID, Identifier.BIBLIOTHECA_ID):
-            foreign_id = foreign_id.lower()
-        if not cls.valid_as_foreign_identifier(
-                foreign_identifier_type, foreign_id):
-            raise ValueError(
-                '"%s" is not a valid %s.' % (
-                    foreign_id, foreign_identifier_type
-                )
-            )
         if autocreate:
             m = get_one_or_create
         else:
@@ -1768,6 +1763,25 @@ class Identifier(Base):
             return result
         else:
             return result, False
+
+    @classmethod
+    def prepare_foreign_type_and_identifier(cls, foreign_type, foreign_identifier):
+        if not foreign_type or not foreign_identifier:
+            return (None, None)
+
+        # Turn a deprecated identifier type (e.g. "3M ID" into the
+        # current type (e.g. "Bibliotheca ID").
+        foreign_type = cls.DEPRECATED_NAMES.get(foreign_type, foreign_type)
+
+        if foreign_type in (Identifier.OVERDRIVE_ID, Identifier.BIBLIOTHECA_ID):
+            foreign_identifier = foreign_identifier.lower()
+
+        if not cls.valid_as_foreign_identifier(foreign_type, foreign_identifier):
+            raise ValueError('"%s" is not a valid %s.' % (
+                foreign_identifier, foreign_type
+            ))
+
+        return (foreign_type, foreign_identifier)
 
     @classmethod
     def valid_as_foreign_identifier(cls, type, id):
@@ -1857,6 +1871,70 @@ class Identifier(Base):
                 "Could not turn %s into a recognized identifier." %
                 identifier_string)
         return (type, identifier_string)
+
+    @classmethod
+    def parse_urns(cls, _db, identifier_strings):
+        """Batch processes URNs"""
+        failures = list()
+        identifier_details = dict()
+        for urn in identifier_strings:
+            type = identifier = None
+            try:
+                (type, identifier) = cls.prepare_foreign_type_and_identifier(
+                    *cls.type_and_identifier_for_urn(urn)
+                )
+                if type and identifier:
+                    identifier_details[urn] = (type, identifier)
+                else:
+                    failures.append(urn)
+            except ValueError as e:
+                failures.append(urn)
+
+        identifiers_by_urn = dict()
+        def find_existing_identifiers(identifier_details):
+            if not identifier_details:
+                return
+            and_clauses = list()
+            for type, identifier in identifier_details:
+                and_clauses.append(
+                    and_(cls.type==type, cls.identifier==identifier)
+                )
+
+            identifiers = _db.query(cls).filter(or_(*and_clauses)).all()
+            for identifier in identifiers:
+                identifiers_by_urn[identifier.urn] = identifier
+
+        # Find identifiers that are already in the database.
+        find_existing_identifiers(identifier_details.values())
+
+        # Remove the existing identifiers from the identifier_details list,
+        # regardless of whether the provided URN was accurate.
+        existing_details = [(i.type, i.identifier) for i in identifiers_by_urn.values()]
+        identifier_details = {
+            k: v for k, v in identifier_details.items()
+            if v not in existing_details and k not in identifiers_by_urn.keys()
+        }
+
+        # Find any identifier details that don't correspond to an existing
+        # identifier. Try to create them.
+        new_identifiers = list()
+        new_identifiers_details = set([])
+        for urn, details in identifier_details.items():
+            if details in new_identifiers_details:
+                # For some reason, this identifier is here twice.
+                # Don't try to insert it twice.
+                continue
+            new_identifiers.append(dict(type=details[0], identifier=details[1]))
+            new_identifiers_details.add(details)
+
+        # Insert new identifiers into the database, then add them to the
+        # results.
+        if new_identifiers:
+            _db.bulk_insert_mappings(cls, new_identifiers)
+            _db.commit()
+        find_existing_identifiers(identifier_details.values())
+
+        return identifiers_by_urn, failures
 
     @classmethod
     def parse_urn(cls, _db, identifier_string, must_support_license_pools=False):
@@ -2186,7 +2264,8 @@ class Identifier(Base):
     @classmethod
     def missing_coverage_from(
             cls, _db, identifier_types, coverage_data_source, operation=None,
-            count_as_covered=None, count_as_missing_before=None, identifiers=None
+            count_as_covered=None, count_as_missing_before=None, identifiers=None,
+            collection=None
     ):
         """Find identifiers of the given types which have no CoverageRecord
         from `coverage_data_source`.
@@ -2195,9 +2274,15 @@ class Identifier(Base):
         covered if their CoverageRecords have a status in this list.
         :param identifiers: Restrict search to a specific set of identifier objects.
         """
+        if collection:
+            collection_id = collection.id
+        else:
+            collection_id = None
         clause = and_(Identifier.id==CoverageRecord.identifier_id,
                       CoverageRecord.data_source==coverage_data_source,
-                      CoverageRecord.operation==operation)
+                      CoverageRecord.operation==operation,
+                      CoverageRecord.collection_id==collection_id
+        )
         qu = _db.query(Identifier).outerjoin(CoverageRecord, clause)
         if identifier_types:
             qu = qu.filter(Identifier.type.in_(identifier_types))
@@ -2236,11 +2321,17 @@ class Identifier(Base):
                 if not description or resource.quality > description.quality:
                     description = resource
 
+        last_coverage_update = None
+        if self.coverage_records:
+            timestamps = [c.timestamp for c in self.coverage_records]
+            last_coverage_update = max(timestamps)
+
         quality = Measurement.overall_quality(self.measurements)
         from opds import AcquisitionFeed
         return AcquisitionFeed.minimal_opds_entry(
-            identifier=self, cover=cover_image, 
-            description=description, quality=quality)
+            identifier=self, cover=cover_image, description=description,
+            quality=quality, most_recent_update=last_coverage_update
+        )
 
 
 class Contributor(Base):
@@ -3519,7 +3610,7 @@ class Work(Base):
         DataSource.GUTENBERG: 0,
         DataSource.RB_DIGITAL: 0.4,
         DataSource.OVERDRIVE: 0.4,
-        DataSource.THREEM : 0.65,
+        DataSource.BIBLIOTHECA : 0.65,
         DataSource.AXIS_360: 0.65,
         DataSource.STANDARD_EBOOKS: 0.8,
         DataSource.UNGLUE_IT: 0.4,
@@ -3740,6 +3831,20 @@ class Work(Base):
         return q2
 
     @classmethod
+    def for_unchecked_subjects(cls, _db):
+        """Find all Works whose LicensePools have an Identifier that
+        is classified under an unchecked Subject.
+
+        This is a good indicator that the Work needs to be
+        reclassified.
+        """
+        qu = _db.query(Work).join(Work.license_pools).join(
+            LicensePool.identifier).join(
+                Identifier.classifications).join(
+                    Classification.subject)
+        return qu.filter(Subject.checked==False).distinct()
+
+    @classmethod
     def open_access_for_permanent_work_id(cls, _db, pwid, medium):
         """Find or create the Work encompassing all open-access LicensePools
         whose presentation Editions have the given permanent work ID and
@@ -3836,7 +3941,8 @@ class Work(Base):
                 # This needs to have its own Work--we don't mix
                 # open-access and commercial versions of the same book.
                 pool.work = None
-                pool.presentation_edition.work = None
+                if pool.presentation_edition:
+                    pool.presentation_edition.work = None
                 other_work, is_new = pool.calculate_work()
             elif not pool.presentation_edition:
                 # A LicensePool with no presentation edition
@@ -5689,8 +5795,7 @@ class Subject(Base):
     FAST = Classifier.FAST
     DDC = Classifier.DDC              # Dewey Decimal Classification
     OVERDRIVE = Classifier.OVERDRIVE  # Overdrive's classification system
-    ONECLICK = Classifier.ONECLICK    # OneClick's genre system
-    THREEM = Classifier.THREEM        # 3M's classification system
+    RBDIGITAL = Classifier.RBDIGITAL  # RBdigital's genre system
     BISAC = Classifier.BISAC
     BIC = Classifier.BIC              # BIC Subject Categories
     TAG = Classifier.TAG              # Folksonomic tags.
@@ -5699,11 +5804,11 @@ class Subject(Base):
 
     # Types with terms that are suitable for search.
     TYPES_FOR_SEARCH = [
-        FAST, OVERDRIVE, THREEM, BISAC, TAG
+        FAST, OVERDRIVE, BISAC, TAG
     ]
 
     AXIS_360_AUDIENCE = Classifier.AXIS_360_AUDIENCE
-    ONECLICK_AUDIENCE = Classifier.ONECLICK_AUDIENCE
+    RBDIGITAL_AUDIENCE = Classifier.RBDIGITAL_AUDIENCE
     GRADE_LEVEL = Classifier.GRADE_LEVEL
     AGE_RANGE = Classifier.AGE_RANGE
     LEXILE_SCORE = Classifier.LEXILE_SCORE
@@ -5723,13 +5828,16 @@ class Subject(Base):
         SIMPLIFIED_GENRE : SIMPLIFIED_GENRE,
         SIMPLIFIED_FICTION_STATUS : SIMPLIFIED_FICTION_STATUS,
         "http://librarysimplified.org/terms/genres/Overdrive/" : OVERDRIVE,
-        "http://librarysimplified.org/terms/genres/3M/" : THREEM,
+        "http://librarysimplified.org/terms/genres/3M/" : BISAC,
         "http://id.worldcat.org/fast/" : FAST, # I don't think this is official.
         "http://purl.org/dc/terms/LCC" : LCC,
         "http://purl.org/dc/terms/LCSH" : LCSH,
         "http://purl.org/dc/terms/DDC" : DDC,
         "http://schema.org/typicalAgeRange" : AGE_RANGE,
         "http://schema.org/audience" : FREEFORM_AUDIENCE,
+        "http://www.bisg.org/standards/bisac_subject/" : BISAC,
+        # Feedbooks uses a modified BISAC which we know how to handle.
+        "http://www.feedbooks.com/categories" : BISAC,
     }
 
     uri_lookup = dict()
@@ -5951,7 +6059,8 @@ class Subject(Base):
                 )
         self.fiction = fiction
 
-        if numericrange_to_tuple(self.target_age) != target_age:
+        if (numericrange_to_tuple(self.target_age) != target_age and
+            not (not self.target_age and not target_age)):
             log.info(
                 "%s:%s target_age %r=>%r", self.type, self.identifier,
                 self.target_age, tuple_to_numericrange(target_age)
@@ -5989,12 +6098,7 @@ class Classification(Base):
     # This goes into Classification rather than Subject because it's
     # possible that one particular data source could use a certain
     # subject type in an unreliable way.
-    #
-    # In fact, the 3M classifications are basically BISAC
-    # classifications used in an unreliable way, so we could merge
-    # them in the future.
     _juvenile_subject_types = set([
-        Subject.THREEM,
         Subject.LCC
     ])
 
@@ -6108,17 +6212,21 @@ class CachedFeed(Base):
     id = Column(Integer, primary_key=True)
 
     # Every feed is associated with a lane. If null, this is a feed
-    # for the top level.
-    lane_name = Column(Unicode, nullable=True)
-
-    # Every feed includes book from a subset of available languages
-    languages = Column(Unicode)
+    # for a WorkList. If work_id is also null, it's a feed for the
+    # top-level.
+    lane_id = Column(
+        Integer, ForeignKey('lanes.id'),
+        nullable=True, index=True)
 
     # Every feed has a timestamp reflecting when it was created.
     timestamp = Column(DateTime, nullable=True)
 
     # A feed is of a certain type--currently either 'page' or 'groups'.
     type = Column(Unicode, nullable=False)
+
+    # A feed associated with a WorkList can have a unique key.
+    # This should be null if the feed is associated with a Lane.
+    unique_key = Column(Unicode, nullable=True)
 
     # A 'page' feed is associated with a set of values for the facet
     # groups.
@@ -6151,26 +6259,32 @@ class CachedFeed(Base):
     def fetch(cls, _db, lane, type, facets, pagination, annotator,
               force_refresh=False, max_age=None):
         from opds import AcquisitionFeed
+        from lane import Lane, WorkList
         if max_age is None:
-            if lane and hasattr(lane, 'MAX_CACHE_AGE'):
-                max_age = lane.MAX_CACHE_AGE
-            elif type == cls.GROUPS_TYPE:
+            if type == cls.GROUPS_TYPE:
                 max_age = AcquisitionFeed.grouped_max_age(_db)
             elif type == cls.PAGE_TYPE:
                 max_age = AcquisitionFeed.nongrouped_max_age(_db)
+            elif hasattr(lane, 'MAX_CACHE_AGE'):
+                max_age = lane.MAX_CACHE_AGE
+            else:
+                max_age = 0
         if isinstance(max_age, int):
             max_age = datetime.timedelta(seconds=max_age)
+        if lane and isinstance(lane, Lane):
+            lane_id = lane.id
+            unique_key = None
+        else:
+            lane_id = None
+            unique_key = "%s-%s-%s" % (lane.display_name, lane.language_key, lane.audience_key)
         work = None
         if lane:
-            lane_name = unicode(lane.name)
             work = getattr(lane, 'work', None)
-        else:
-            lane_name = None
-
-        if not lane.languages:
-            languages_key = None
-        else:
-            languages_key = unicode(",".join(lane.languages))
+        library = None
+        if lane and isinstance(lane, Lane):
+            library = lane.library
+        elif lane and isinstance(lane, WorkList):
+            library = lane.get_library(_db)
 
         if facets:
             facets_key = unicode(facets.query_string)
@@ -6189,11 +6303,11 @@ class CachedFeed(Base):
             _db, cls,
             on_multiple='interchangeable',
             constraint=constraint_clause,
-            lane_name=lane_name,
-            library=lane.library,
+            lane_id=lane_id,
+            unique_key=unique_key,
+            library=library,
             work=work,
             type=type,
-            languages=languages_key,
             facets=facets_key,
             pagination=pagination_key)
 
@@ -6215,9 +6329,14 @@ class CachedFeed(Base):
                 # Rather than generate an error (which will provide a
                 # terrible user experience), fall back to generating a
                 # default page-type feed, which should be cheap to fetch.
+                identifier = None
+                if isinstance(lane, Lane):
+                    identifier = lane.id
+                elif isinstance(lane, WorkList):
+                    identifier = lane.display_name
                 cls.log.warn(
                     "Could not generate a groups feed for %s, falling back to a page feed.",
-                    lane.name
+                    identifier
                 )
                 return cls.fetch(
                     _db, lane, CachedFeed.PAGE_TYPE, facets, pagination, 
@@ -6245,16 +6364,16 @@ class CachedFeed(Base):
             length = len(self.content)
         else:
             length = "No content"
-        return "<CachedFeed #%s %s %s %s %s %s %s %s >" % (
-            self.id, self.languages, self.lane_name, self.type, 
+        return "<CachedFeed #%s %s %s %s %s %s %s >" % (
+            self.id, self.lane_id, self.type,
             self.facets, self.pagination,
             self.timestamp, length
         )
 
 
 Index(
-    "ix_cachedfeeds_library_id_lane_name_type_facets_pagination",
-    CachedFeed.library_id, CachedFeed.lane_name, CachedFeed.type,
+    "ix_cachedfeeds_library_id_lane_id_type_facets_pagination",
+    CachedFeed.library_id, CachedFeed.lane_id, CachedFeed.type,
     CachedFeed.facets, CachedFeed.pagination
 )
 
@@ -6917,7 +7036,7 @@ class LicensePool(Base):
         )
         return message, tuple(args)
 
-    def loan_to(self, patron, start=None, end=None, fulfillment=None):
+    def loan_to(self, patron, start=None, end=None, fulfillment=None, external_identifier=None):
         _db = Session.object_session(patron)
         kwargs = dict(start=start or datetime.datetime.utcnow(),
                       end=end)
@@ -6926,6 +7045,8 @@ class LicensePool(Base):
             create_method_kwargs=kwargs)
         if fulfillment:
             loan.fulfillment = fulfillment
+        if external_identifier:
+            loan.external_identifier = external_identifier
         return loan, is_new
 
     def on_hold_to(self, patron, start=None, end=None, position=None):
@@ -7351,7 +7472,7 @@ class RightsStatus(Base):
         DataSource.OA_CONTENT_SERVER : GENERIC_OPEN_ACCESS,
 
         DataSource.OVERDRIVE: IN_COPYRIGHT,
-        DataSource.THREEM: IN_COPYRIGHT,
+        DataSource.BIBLIOTHECA: IN_COPYRIGHT,
         DataSource.AXIS_360: IN_COPYRIGHT,
     }
     
@@ -7766,6 +7887,8 @@ class Timestamp(Base):
             create_method_kwargs=dict(timestamp=date))
         if not was_new:
             stamp.timestamp = date
+        # Committing immediately reduces the risk of contention.
+        _db.commit()
         return stamp
 
     __table_args__ = (
@@ -7798,9 +7921,9 @@ class Representation(Base):
     GIF_MEDIA_TYPE = u"image/gif"
     SVG_MEDIA_TYPE = u"image/svg+xml"
     MP3_MEDIA_TYPE = u"audio/mpeg"
+    ZIP_MEDIA_TYPE = u"application/zip"
     MP4_MEDIA_TYPE = u"video/mp4"
     WMV_MEDIA_TYPE = u"video/x-ms-wmv"
-    ZIP_MEDIA_TYPE = u"application/zip"
     OCTET_STREAM_MEDIA_TYPE = u"application/octet-stream"
     TEXT_PLAIN = u"text/plain"
     AUDIOBOOK_MANIFEST_MEDIA_TYPE = u"application/audiobook+json"
@@ -7844,6 +7967,7 @@ class Representation(Base):
         PNG_MEDIA_TYPE: "png",
         SVG_MEDIA_TYPE: "svg",
         GIF_MEDIA_TYPE: "gif",
+        ZIP_MEDIA_TYPE: "zip",
         TEXT_PLAIN: "txt",
         TEXT_HTML_MEDIA_TYPE: "html",
         APPLICATION_XML_MEDIA_TYPE: "xml",
@@ -8001,6 +8125,8 @@ class Representation(Base):
     @classmethod
     def guess_media_type(cls, filename):
         """Guess a likely media type from a filename."""
+        if not filename:
+            return None
         filename = filename.lower()
         for extension, media_type in cls.MEDIA_TYPE_FOR_EXTENSION.items():
             if filename.endswith(extension):
@@ -8702,10 +8828,12 @@ class DeliveryMechanism(Base, HasFullTableCache):
 
     NO_DRM = None
     ADOBE_DRM = u"application/vnd.adobe.adept+xml"
+    FINDAWAY_DRM = u"application/vnd.librarysimplified.findaway.license+json"
     KINDLE_DRM = u"Kindle DRM"
     NOOK_DRM = u"Nook DRM"
     STREAMING_DRM = u"Streaming"
     OVERDRIVE_DRM = u"Overdrive DRM"
+    BEARER_TOKEN = u"application/vnd.librarysimplified.bearer-token+json"
 
     STREAMING_PROFILE = ";profile=http://librarysimplified.org/terms/profiles/streaming-media"
     MEDIA_TYPES_FOR_STREAMING = {
@@ -10374,35 +10502,44 @@ class Collection(Base, HasFullTableCache):
         for child in self.children:
             child.protocol = new_protocol
 
-    # TODO: The default loan period needs to be expanded to handle
-    # different defaults for different media types (e.g. on Overdrive
-    # the default loan period for audiobooks is 14 days, and for video
-    # it's 5 days). This isn't a high priority because the license
-    # source generally tells us when each loan will end.
-    DEFAULT_LOAN_PERIOD_KEY = 'default_loan_period'
+    # For collections that can control the duration of the loans they
+    # create, the durations are stored in these settings and new loans are
+    # expected to be created using these settings. For collections
+    # where loan duration is negotiated out-of-bounds, all loans are
+    # _assumed_ to have these durations unless we hear otherwise from
+    # the server.
+    AUDIOBOOK_LOAN_DURATION_KEY = 'audio_loan_duration'
+    EBOOK_LOAN_DURATION_KEY = 'ebook_loan_duration'
     STANDARD_DEFAULT_LOAN_PERIOD = 21
         
-    @hybrid_property
-    def default_loan_period(self):
+    def default_loan_period(self, library, medium=Edition.BOOK_MEDIUM):
         """Until we hear otherwise from the license provider, we assume
         that someone who borrows a non-open-access item from this
         collection has it for this number of days.
         """
+        return self.default_loan_period_setting(
+            library, medium).int_value or self.STANDARD_DEFAULT_LOAN_PERIOD
+
+    def default_loan_period_setting(self, library, medium=Edition.BOOK_MEDIUM):
+        """Until we hear otherwise from the license provider, we assume
+        that someone who borrows a non-open-access item from this
+        collection has it for this number of days.
+        """
+        _db = Session.object_session(library)
+        if medium == Edition.AUDIO_MEDIUM:
+            key = self.AUDIOBOOK_LOAN_DURATION_KEY
+        else:
+            key = self.EBOOK_LOAN_DURATION_KEY
         return (
-            self.external_integration.setting(
-                self.DEFAULT_LOAN_PERIOD_KEY).int_value
-            or self.STANDARD_DEFAULT_LOAN_PERIOD
+            ConfigurationSetting.for_library_and_externalintegration(
+                _db, key, library, self.external_integration
+            )
         )
 
-    @default_loan_period.setter
-    def set_default_loan_period(self, new_value):
-        new_value = int(new_value)
-        self.external_integration.setting(
-            self.DEFAULT_LOAN_PERIOD_KEY).value = str(new_value)
 
     DEFAULT_RESERVATION_PERIOD_KEY = 'default_reservation_period'
     STANDARD_DEFAULT_RESERVATION_PERIOD = 3
-            
+
     @hybrid_property
     def default_reservation_period(self):
         """Until we hear otherwise from the license provider, we assume
@@ -10411,16 +10548,16 @@ class Collection(Base, HasFullTableCache):
         """
         return (
             self.external_integration.setting(
-                self.DEFAULT_RESERVATION_PERIOD_KEY).int_value
-            or self.STANDARD_DEFAULT_RESERVATION_PERIOD
+                self.DEFAULT_RESERVATION_PERIOD_KEY,
+            ).int_value or self.STANDARD_DEFAULT_RESERVATION_PERIOD
         )
 
     @default_reservation_period.setter
     def set_default_reservation_period(self, new_value):
         new_value = int(new_value)
         self.external_integration.setting(
-            self.DEFAULT_RESERVATION_PERIOD__KEY).value = str(new_value)
-            
+            self.DEFAULT_RESERVATION_PERIOD_KEY).value = str(new_value)
+
     def create_external_integration(self, protocol):
         """Create an ExternalIntegration for this Collection.
 
@@ -10617,28 +10754,77 @@ class Collection(Base, HasFullTableCache):
                 lines.append('Setting "%s": "%s"' % (setting.key, setting.value))
         return lines
 
-    def catalog_identifier(self, _db, identifier):
+    def catalog_identifier(self, identifier):
         """Inserts an identifier into a catalog"""
-        if identifier not in self.catalog:
-            self.catalog.append(identifier)
-            flush(_db)
+        self.catalog_identifiers([identifier])
+
+    def catalog_identifiers(self, identifiers):
+        """Inserts identifiers into the catalog"""
+        if not identifiers:
+            # Nothing to do.
+            return
+
+        _db = Session.object_session(identifiers[0])
+        already_in_catalog = _db.query(Identifier).join(
+            CollectionIdentifier
+        ).filter(
+            CollectionIdentifier.collection_id==self.id
+        ).filter(
+             Identifier.id.in_([x.id for x in identifiers])
+        ).all()
+
+        new_catalog_entries = [
+            dict(collection_id=self.id, identifier_id=identifier.id)
+            for identifier in identifiers
+            if identifier not in already_in_catalog
+        ]
+        _db.bulk_insert_mappings(CollectionIdentifier, new_catalog_entries)
+        _db.commit()
 
     def works_updated_since(self, _db, timestamp):
-        """Returns all works in a collection's catalog that have been updated
-        since the last time the catalog was checked.
+        """Finds all works in a collection's catalog that have been updated
+           since the timestamp. Used in the metadata wrangler.
+
+           :return: a Query
         """
-        query = _db.query(Work).join(Work.coverage_records)\
+        opds_operation = WorkCoverageRecord.GENERATE_OPDS_OPERATION
+        qu = _db.query(Work).join(Work.coverage_records)\
             .join(Work.license_pools).join(Identifier)\
-            .join(Identifier.collections)\
-            .filter(Collection.id==self.id)\
-            .options(joinedload(Work.license_pools, LicensePool.identifier))
+            .join(Identifier.collections).filter(
+                Collection.id==self.id,
+                WorkCoverageRecord.operation==opds_operation,
+            ).options(joinedload(Work.license_pools, LicensePool.identifier))
 
         if timestamp:
-            query = query.filter(
+            qu = qu.filter(
                 WorkCoverageRecord.timestamp > timestamp
             )
 
-        return query.distinct()
+        qu = qu.order_by(WorkCoverageRecord.timestamp)
+        return qu
+
+    def isbns_updated_since(self, _db, timestamp):
+        """Finds all ISBNs in a collection's catalog that have been updated
+           since the timestamp but don't have a Work to show for it. Used in
+           the metadata wrangler.
+
+           :return: a Query
+        """
+        isbns = _db.query(Identifier, func.max(CoverageRecord.timestamp).label('latest'))\
+            .join(Identifier.collections)\
+            .join(Identifier.coverage_records)\
+            .outerjoin(Identifier.licensed_through)\
+            .group_by(Identifier.id).order_by('latest')\
+            .filter(
+                Collection.id==self.id,
+                LicensePool.work_id==None,
+                CoverageRecord.status==CoverageRecord.SUCCESS,
+            ).enable_eagerloads(False).options(joinedload(Identifier.coverage_records))
+
+        if timestamp:
+            isbns = isbns.filter(CoverageRecord.timestamp > timestamp)
+
+        return isbns
 
 
 collections_libraries = Table(
@@ -10680,6 +10866,18 @@ collections_identifiers = Table(
     UniqueConstraint('collection_id', 'identifier_id'),
 )
 
+# Create an ORM model for the collections_identifiers join table
+# so it can be used in a bulk_insert_mappings call.
+class CollectionIdentifier(object):
+    pass
+
+mapper(
+    CollectionIdentifier, collections_identifiers,
+    primary_key=(
+        collections_identifiers.columns.collection_id,
+        collections_identifiers.columns.identifier_id
+    )
+)
 
 class IntegrationClient(Base):
     """A client that has authenticated access to this application.
@@ -10718,7 +10916,7 @@ class IntegrationClient(Base):
 
         generate_secret = (client.shared_secret is None) or submitted_secret
         if generate_secret:
-            client.shared_secret = os.urandom(24).encode('hex')
+            client.shared_secret = unicode(os.urandom(24).encode('hex'))
 
         return client, is_new
 
@@ -10732,9 +10930,11 @@ class IntegrationClient(Base):
 
     @classmethod
     def authenticate(cls, _db, shared_secret):
-        client = get_one(_db, cls, shared_secret=shared_secret)
+        client = get_one(_db, cls, shared_secret=unicode(shared_secret))
         if client:
             client.last_accessed = datetime.datetime.utcnow()
+            # Committing immediately reduces the risk of contention.
+            _db.commit()
             return client
         return None
 
@@ -10770,6 +10970,8 @@ def numericrange_to_tuple(r):
 
 def tuple_to_numericrange(t):
     """Helper method to convert a tuple to an inclusive NumericRange."""
+    if not t:
+        return None
     return NumericRange(t[0], t[1], '[]')
 
 def site_configuration_has_changed(_db, timeout=1):
@@ -10872,7 +11074,15 @@ def licensepool_open_access_change(target, value, oldvalue, initiator):
         return
     work.external_index_needs_updating()
 
-            
+def directly_modified(obj):
+    """Return True only if `obj` has itself been modified, as opposed to
+    having an object added or removed to one of its associated
+    collections.
+    """
+    return Session.object_session(obj).is_modified(
+        obj, include_collections=False
+    )
+
 # Most of the time, we can know whether a change to the database is
 # likely to require that the application reload the portion of the
 # configuration it gets from the database. These hooks will call
@@ -10897,18 +11107,22 @@ def configuration_relevant_collection_change(target, value, initiator):
 
 @event.listens_for(Library, 'after_insert')
 @event.listens_for(Library, 'after_delete')
-@event.listens_for(Library, 'after_update')
 @event.listens_for(ExternalIntegration, 'after_insert')
 @event.listens_for(ExternalIntegration, 'after_delete')
-@event.listens_for(ExternalIntegration, 'after_update')
 @event.listens_for(Collection, 'after_insert')
 @event.listens_for(Collection, 'after_delete')
-@event.listens_for(Collection, 'after_update')
 @event.listens_for(ConfigurationSetting, 'after_insert')
 @event.listens_for(ConfigurationSetting, 'after_delete')
-@event.listens_for(ConfigurationSetting, 'after_update')
 def configuration_relevant_lifecycle_event(mapper, connection, target):
     site_configuration_has_changed(target)
+
+@event.listens_for(Library, 'after_update')
+@event.listens_for(ExternalIntegration, 'after_update')
+@event.listens_for(Collection, 'after_update')
+@event.listens_for(ConfigurationSetting, 'after_update')
+def configuration_relevant_update(mapper, connection, target):
+    if directly_modified(target):
+        site_configuration_has_changed(target)
 
 @event.listens_for(Collection, 'after_insert')
 @event.listens_for(Collection, 'after_delete')

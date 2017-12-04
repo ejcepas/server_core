@@ -276,6 +276,7 @@ class MetadataWranglerOPDSLookup(SimplifiedOPDSLookup):
 class MockSimplifiedOPDSLookup(SimplifiedOPDSLookup):
 
     def __init__(self, *args, **kwargs):
+        self.requests = []
         self.responses = []
         super(MockSimplifiedOPDSLookup, self).__init__(*args, **kwargs)
 
@@ -286,6 +287,7 @@ class MockSimplifiedOPDSLookup(SimplifiedOPDSLookup):
         )
 
     def _get(self, url, *args, **kwargs):
+        self.requests.append((url, args, kwargs))
         response = self.responses.pop()
         return HTTP._process_response(
             url, response, kwargs.get('allowed_response_codes'),
@@ -296,6 +298,7 @@ class MockSimplifiedOPDSLookup(SimplifiedOPDSLookup):
 class MockMetadataWranglerOPDSLookup(MockSimplifiedOPDSLookup, MetadataWranglerOPDSLookup):
 
     def _post(self, url, *args, **kwargs):
+        self.requests.append((url, args, kwargs))
         response = self.responses.pop()
         return HTTP._process_response(
             url, response, kwargs.get('allowed_response_codes'),
@@ -342,6 +345,16 @@ class OPDSImporter(object):
         }
     ]
 
+    # Subclasses of OPDSImporter may define a different parser class that's
+    # a subclass of OPDSXMLParser. For example, a subclass may want to use
+    # tags from an additional namespace.
+    PARSER_CLASS = OPDSXMLParser
+
+    # Subclasses of OPDSImporter may define a list of status codes
+    # that should be treated as indicating success, rather than failure,
+    # when they show up in <simplified:message> tags.
+    SUCCESS_STATUS_CODES = None
+
     def __init__(self, _db, collection, data_source_name=None,
                  identifier_mapping=None, mirror=None, http_get=None,
                  metadata_client=None, content_modifier=None,
@@ -371,7 +384,6 @@ class OPDSImporter(object):
         :param content_modifier: A function that may modify-in-place
         representations (such as images and EPUB documents) as they
         come in from the network.
-
         """
         self._db = _db
         self.log = logging.getLogger("OPDS Importer")
@@ -513,7 +525,8 @@ class OPDSImporter(object):
         # different data source or a different collection, that's fine
         # too.
         pool = get_one(
-            self._db, LicensePool, identifier=edition.primary_identifier
+            self._db, LicensePool, identifier=edition.primary_identifier,
+            on_multiple='interchangeable'
         )
 
         if pool:
@@ -533,7 +546,10 @@ class OPDSImporter(object):
 
     @classmethod
     def extract_next_links(self, feed):
-        parsed = feedparser.parse(feed)
+        if isinstance(feed, basestring):
+            parsed = feedparser.parse(feed)
+        else:
+            parsed = feed
         feed = parsed['feed']
         next_links = []
         if feed and 'links' in feed:
@@ -546,7 +562,10 @@ class OPDSImporter(object):
 
     @classmethod
     def extract_last_update_dates(cls, feed):
-        parsed_feed = feedparser.parse(feed)
+        if isinstance(feed, basestring):
+            parsed_feed = feedparser.parse(feed)
+        else:
+            parsed_feed = feed
         return [
             cls.last_update_date_for_feedparser_entry(entry)
             for entry in parsed_feed['entries']
@@ -595,15 +614,9 @@ class OPDSImporter(object):
 
         # translate the id in failures to identifier.urn
         identified_failures = {}
-        for id, failure in fp_failures.items() + xml_failures.items():
-            external_identifier, ignore = Identifier.parse_urn(self._db, id)
-            if self.identifier_mapping:
-                internal_identifier = self.identifier_mapping.get(
-                    external_identifier, external_identifier)
-            else:
-                internal_identifier = external_identifier
-            failure.obj = internal_identifier
-            identified_failures[internal_identifier.urn] = failure
+        for urn, failure in fp_failures.items() + xml_failures.items():
+            identifier, failure = self.handle_failure(urn, failure)
+            identified_failures[identifier.urn] = failure
 
         # Use one loop for both, since the id will be the same for both dictionaries.
         metadata = {}
@@ -676,6 +689,35 @@ class OPDSImporter(object):
                     # ODL support.
                     pass
         return metadata, identified_failures
+
+    def handle_failure(self, urn, failure):
+        """Convert a URN and a failure message that came in through
+        an OPDS feed into an Identifier and a CoverageFailure object.
+
+        The Identifier may not be the one designated by `urn` (if it's
+        found in self.identifier_mapping) and the 'failure' may turn out not
+        to be a CoverageFailure at all -- if it's an Identifier, that means
+        that what a normal OPDSImporter would consider 'failure' is
+        considered success.
+        """
+        external_identifier, ignore = Identifier.parse_urn(self._db, urn)
+        if self.identifier_mapping:
+            # The identifier found in the OPDS feed is different from 
+            # the identifier we want to export.
+            internal_identifier = self.identifier_mapping.get(
+                external_identifier, external_identifier)
+        else:
+            internal_identifier = external_identifier
+        if isinstance(failure, Identifier):
+            # The OPDSImporter does not actually consider this a
+            # failure. Signal success by returning the internal
+            # identifier as the 'failure' object.
+            failure = internal_identifier
+        else:
+            # This really is a failure. Associate the internal
+            # identifier with the CoverageFailure object.
+            failure.obj = internal_identifier
+        return internal_identifier, failure
 
     @classmethod
     def _add_format_data(cls, circulation):
@@ -757,7 +799,7 @@ class OPDSImporter(object):
         """
         values = {}
         failures = {}
-        parser = OPDSXMLParser()
+        parser = cls.PARSER_CLASS()
         root = etree.parse(StringIO(feed))
 
         # Some OPDS feeds (eg Standard Ebooks) contain relative urls,
@@ -778,7 +820,14 @@ class OPDSImporter(object):
         for failure in cls.coveragefailures_from_messages(
                 data_source, parser, root
         ):
-            failures[failure.obj.urn] = failure
+            if isinstance(failure, Identifier):
+                # The Simplified <message> tag does not actually
+                # represent a failure -- it was turned into an
+                # Identifier instead of a CoverageFailure.
+                urn = failure.urn
+            else:
+                urn = failure.obj.urn
+            failures[urn] = failure
 
         # Then turn Atom <entry> tags into Metadata objects.
         for entry in parser._xpath(root, '/atom:feed/atom:entry'):
@@ -961,7 +1010,7 @@ class OPDSImporter(object):
 
         :return: A rights URI.
         """
-        rights = OPDSXMLParser._xpath1(entry, 'rights')
+        rights = cls.PARSER_CLASS._xpath1(entry, 'rights')
         if rights:
             return cls.rights_uri(rights)
     
@@ -1031,9 +1080,15 @@ class OPDSImporter(object):
             # Identifier so we can't turn it into a CoverageFailure.
             return None
 
-        if message.status_code == 200:
+        if (cls.SUCCESS_STATUS_CODES 
+            and message.status_code in cls.SUCCESS_STATUS_CODES):
             # This message is telling us that nothing went wrong. It
-            # shouldn't become a CoverageFailure.
+            # should be treated as a success.
+            return identifier
+
+        if message.status_code == 200:
+            # By default, we treat a message with a 200 status code
+            # as though nothing had been returned at all.
             return None
 
         description = message.message
@@ -1128,6 +1183,11 @@ class OPDSImporter(object):
             cls.extract_link(link_tag, feed_url, rights_uri)
             for link_tag in parser._xpath(entry_tag, 'atom:link')
         ])
+
+        series_tag = parser._xpath(entry_tag, 'schema:Series')
+        if series_tag:
+            data['series'], data['series_position'] = cls.extract_series(series_tag[0])
+
         return data
 
     @classmethod
@@ -1339,6 +1399,12 @@ class OPDSImporter(object):
         except ValueError:
             return None
 
+    @classmethod
+    def extract_series(cls, series_tag):
+        attr = series_tag.attrib
+        series_name = attr.get('{http://schema.org/}name', None)
+        series_position = attr.get('{http://schema.org/}position', None)
+        return series_name, series_position
 
 class OPDSImportMonitor(CollectionMonitor):
 

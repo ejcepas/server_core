@@ -50,6 +50,7 @@ from model import (
     Representation,
     RightsStatus,
     Subject,
+    Work,
 )
 from coverage import CoverageFailure
 
@@ -432,6 +433,9 @@ class TestOPDSImporter(OPDSImporterTest):
         eq_(0.25, r3.value)
         eq_(1, r3.weight)
 
+        eq_('Animal Colors', periodical['series'])
+        eq_('1', periodical['series_position'])
+
     def test_extract_metadata_from_elementtree_treats_message_as_failure(self):
         data_source = DataSource.lookup(self._db, DataSource.OA_CONTENT_SERVER)
 
@@ -463,6 +467,59 @@ class TestOPDSImporter(OPDSImporterTest):
         eq_('urn:librarysimplified.org/terms/id/Gutenberg ID/100', message.urn)
         eq_(404, message.status_code)
         eq_("I've never heard of this work.", message.message)
+
+    def test_handle_failure(self):
+        axis_id = self._identifier(identifier_type=Identifier.AXIS_360_ID)
+        axis_isbn = self._identifier(Identifier.ISBN, "9781453219539")
+        identifier_mapping = {axis_isbn : axis_id}
+        importer = OPDSImporter(
+            self._db, collection=None, 
+            data_source_name=DataSource.OA_CONTENT_SERVER,
+            identifier_mapping = identifier_mapping
+        )        
+
+        # The simplest case -- an identifier associated with a
+        # CoverageFailure. The Identifier and CoverageFailure are
+        # returned as-is.
+        input_failure = CoverageFailure(object(), "exception")
+
+        urn = "urn:isbn:9781449358068"
+        expect_identifier, ignore = Identifier.parse_urn(self._db, urn)
+        identifier, output_failure = importer.handle_failure(
+            urn, input_failure
+        )
+        eq_(expect_identifier, identifier)
+        eq_(input_failure, output_failure)
+
+        # A normal OPDSImporter would consider this a failure, but
+        # because the 'failure' is an Identifier, not a
+        # CoverageFailure, we're going to treat it as a success.
+        identifier, not_a_failure = importer.handle_failure(
+            "urn:isbn:9781449358068", self._identifier()
+        )
+        eq_(expect_identifier, identifier)
+        eq_(identifier, not_a_failure)
+        # Note that the 'failure' object retuned is the Identifier that 
+        # was passed in, not the Identifier that substituted as the 'failure'.
+        # (In real usage, though, they should be the same.)
+
+        # An identifier that maps to some other identifier,
+        # associated with a CoverageFailure.
+        identifier, output_failure = importer.handle_failure(
+            axis_isbn.urn, input_failure
+        )
+        eq_(axis_id, identifier)
+        eq_(input_failure, output_failure)
+
+        # An identifier that maps to some other identifier,
+        # in a scenario where what OPDSImporter considers failure
+        # is considered success.
+        identifier, not_a_failure = importer.handle_failure(
+            axis_isbn.urn, self._identifier()
+        )
+        eq_(axis_id, identifier)
+        eq_(axis_id, not_a_failure)
+        
         
     def test_coveragefailure_from_message(self):
         """Test all the different ways a <simplified:message> tag might
@@ -500,6 +557,58 @@ class TestOPDSImporter(OPDSImporterTest):
         
         no_information = f(identifier.urn, None, None)
         eq_("No detail provided.", no_information.exception)
+
+    def test_coveragefailure_from_message_with_success_status_codes(self):
+        """When an OPDSImporter defines SUCCESS_STATUS_CODES, messages with
+        those status codes are always treated as successes.
+        """
+        class Mock(OPDSImporter):
+            SUCCESS_STATUS_CODES = [200, 999]
+
+        data_source = DataSource.lookup(self._db, DataSource.OVERDRIVE)
+
+        def f(*args):
+            message = OPDSMessage(*args)
+            return Mock.coveragefailure_from_message(data_source, message)
+
+        identifier = self._identifier()
+
+        # If the status code is 999, then the identifier is returned
+        # instead of a CoverageFailure -- we know that 999 means
+        # coverage was in fact provided.
+        failure = f(identifier.urn, "999", "hooray!")
+        eq_(identifier, failure)
+
+        # If the status code is 200, then the identifier is returned
+        # instead of None.
+        failure = f(identifier.urn, "200", "ok!")
+        eq_(identifier, failure)
+
+        # If the status code is anything else, a CoverageFailure
+        # is returned.
+        failure = f(identifier.urn, 500, "hooray???")
+        assert isinstance(failure, CoverageFailure)
+        eq_("500: hooray???", failure.exception)
+
+    def test_extract_metadata_from_elementtree_handles_messages_that_become_identifiers(self):
+        not_a_failure = self._identifier()
+        class MockOPDSImporter(OPDSImporter):
+            @classmethod
+            def coveragefailures_from_messages(
+                    cls, data_source, message, success_on_200=False):
+                """No matter what input we get, we act as though there were 
+                a single simplified:message tag in the OPDS feed, which we
+                decided to treat as success rather than failure.
+                """
+                return [not_a_failure]
+
+        data_source = DataSource.lookup(self._db, DataSource.OA_CONTENT_SERVER)
+
+        values, failures = MockOPDSImporter.extract_metadata_from_elementtree(
+            self.content_server_mini_feed, data_source
+        )
+        eq_({not_a_failure.urn: not_a_failure}, failures)
+                
         
     def test_extract_metadata_from_elementtree_handles_exception(self):
         class DoomedElementtreeOPDSImporter(OPDSImporter):
@@ -1042,6 +1151,26 @@ class TestOPDSImporter(OPDSImporterTest):
         importer = OPDSImporter(self._db, None)
         importer.build_identifier_mapping([isbn1])
         eq_(None, importer.identifier_mapping)
+
+    def test_update_work_for_edition_having_multiple_license_pools(self):
+        # There are two collections with a LicensePool associated with
+        # this Edition.
+        edition, lp = self._edition(with_license_pool=True)
+        collection2 = self._collection()
+        lp2 = self._licensepool(edition=edition, collection=collection2)
+        importer = OPDSImporter(self._db, None)
+
+        # Calling update_work_for_edition creates a Work and associates
+        # it with the edition.
+        eq_(None, edition.work)
+        importer.update_work_for_edition(edition)
+        work = edition.work
+        assert isinstance(work, Work)
+
+        # Both LicensePools are associated with that work.
+        eq_(lp.work, work)
+        eq_(lp2.work, work)
+        
 
 class TestCombine(object):
     """Test that OPDSImporter.combine combines dictionaries in sensible
