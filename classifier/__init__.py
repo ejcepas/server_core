@@ -63,7 +63,6 @@ class Classifier(object):
 
     GUTENBERG_BOOKSHELF = "gutenberg:bookshelf"
     TOPIC = "schema:Topic"
-    TOPIC_TERM = "Topic term"
     PLACE = "schema:Place"
     PERSON = "schema:Person"
     ORGANIZATION = "schema:Organization"

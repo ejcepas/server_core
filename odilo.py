@@ -7,8 +7,6 @@ import logging
 
 from sqlalchemy.orm.session import Session
 
-from httplib import HTTPException
-
 from model import (
     get_one_or_create,
     Collection,
@@ -24,9 +22,7 @@ from model import (
     Subject,
 )
 
-from core.util.http import RequestNetworkException
-
-from core.analytics import Analytics
+from analytics import Analytics
 
 from metadata_layer import (
     CirculationData,
@@ -54,61 +50,40 @@ from util.http import (
     BadResponseException,
 )
 
+from util.personal_names import display_name_to_sort_name
+
+from testing import MockRequestsResponse
+
 
 class OdiloAPI(object):
     log = logging.getLogger("Odilo API")
 
     LIBRARY_API_BASE_URL = u"library_api_base_url"
-    BASE_URL = "http://localhost:8080/api/v2"  # Debug value by default
 
     # --- OAuth ---
-    TOKEN_ENDPOINT = BASE_URL + "/token"
+    TOKEN_ENDPOINT = "/token"
 
     # --- Discovery API ---
-    ALL_PRODUCTS_ENDPOINT = BASE_URL + "/records"
-
-    RECORD_METADATA_ENDPOINT = BASE_URL + "/records/{recordId}"
-    RECORD_AVAILABILITY_ENDPOINT = BASE_URL + "/records/{recordId}/availability"
+    ALL_PRODUCTS_ENDPOINT = "/records"
+    RECORD_METADATA_ENDPOINT = "/records/{recordId}"
+    RECORD_AVAILABILITY_ENDPOINT = "/records/{recordId}/availability"
 
     # --- Circulation API ---
-    CHECKOUT_ENDPOINT = BASE_URL + "/records/{recordId}/checkout"
-    CHECKOUT_GET = BASE_URL + "/checkouts/{checkoutId}"
-    CHECKIN_ENDPOINT = BASE_URL + "/checkouts/{checkoutId}/return"
-    # Downloads given checkout offering the url where to consume the digital resource.
-    CHECKOUT_URL_ENDPOINT = BASE_URL + "/checkouts/{checkoutId}/download"
+    CHECKOUT_ENDPOINT = "/records/{recordId}/checkout"
+    CHECKIN_ENDPOINT = "/checkouts/{checkoutId}/return?patronId={patronId}"
 
-    PLACE_HOLD_ENDPOINT = BASE_URL + "/records/{recordId}/hold"
-    HOLD_GET = BASE_URL + "/holds/{holdId}"
-    RELEASE_HOLD_ENDPOINT = BASE_URL + "/holds/{holdId}/cancel"
+    PLACE_HOLD_ENDPOINT = "/records/{recordId}/hold"
+    RELEASE_HOLD_ENDPOINT = "/holds/{holdId}/cancel"
 
-    PATRON_CHECKOUTS_ENDPOINT = BASE_URL + "/patrons/{patronId}/checkouts"
-    PATRON_HOLDS_ENDPOINT = BASE_URL + "/patrons/{patronId}/holds"
-
-    def update_endpoints_url(self):
-        # --- OAuth ---
-        self.TOKEN_ENDPOINT = self.BASE_URL + "/token"
-
-        # --- Discovery API ---
-        self.ALL_PRODUCTS_ENDPOINT = self.BASE_URL + "/records"
-
-        self.RECORD_METADATA_ENDPOINT = self.BASE_URL + "/records/{recordId}"
-        self.RECORD_AVAILABILITY_ENDPOINT = self.BASE_URL + "/records/{recordId}/availability"
-
-        # --- Circulation API ---
-        self.CHECKOUT_ENDPOINT = self.BASE_URL + "/records/{recordId}/checkout"
-        self.CHECKOUT_GET = self.BASE_URL + "/checkouts/{checkoutId}"
-        self.CHECKIN_ENDPOINT = self.BASE_URL + "/checkouts/{checkoutId}/return"
-        # Downloads given checkout offering the url where to consume the digital resource.
-        self.CHECKOUT_URL_ENDPOINT = self.BASE_URL + "/checkouts/{checkoutId}/download"
-
-        self.PLACE_HOLD_ENDPOINT = self.BASE_URL + "/records/{recordId}/hold"
-        self.HOLD_GET = self.BASE_URL + "/holds/{holdId}"
-        self.RELEASE_HOLD_ENDPOINT = self.BASE_URL + "/holds/{holdId}/cancel"
-
-        self.PATRON_CHECKOUTS_ENDPOINT = self.BASE_URL + "/patrons/{patronId}/checkouts"
-        self.PATRON_HOLDS_ENDPOINT = self.BASE_URL + "/patrons/{patronId}/holds"
+    PATRON_CHECKOUTS_ENDPOINT = "/patrons/{patronId}/checkouts"
+    PATRON_HOLDS_ENDPOINT = "/patrons/{patronId}/holds"
 
     # ---------------------------------------
+
+    ACSM = 'ACSM'
+    ACSM_EPUB = 'ACSM_EPUB'
+    ACSM_PDF = 'ACSM_PDF'
+    EBOOK_STREAMING = 'EBOOK_STREAMING'
 
     PAGE_SIZE_LIMIT = 200
 
@@ -133,10 +108,6 @@ class OdiloAPI(object):
         self.client_key, self.client_secret, self.library_api_base_url = (
             setting.encode('utf8') for setting in settings
         )
-
-        # Set Odilo Connector API URL internally
-        self.BASE_URL = self.library_api_base_url
-        self.update_endpoints_url()
 
         # Get set up with up-to-date credentials from the API.
         self.check_creds()
@@ -172,27 +143,22 @@ class OdiloAPI(object):
 
     def refresh_creds(self, credential):
         """Fetch a new Bearer Token and update the given Credential object."""
-        try:
-            response = self.token_post(
-                self.TOKEN_ENDPOINT,
-                dict(grant_type="client_credentials"),
-                allowed_response_codes=[200]
-            )
-            data = response.json()
-        except (HTTPException, RequestNetworkException) as e:
-            self.log.error("Cannot connect with %s, error: %s" % (self.TOKEN_ENDPOINT, e.message))
-            return None
+
+        response = self.token_post(
+            self.TOKEN_ENDPOINT,
+            dict(grant_type="client_credentials"),
+            allowed_response_codes=[200]
+        )
+        data = response.json()
 
         if response.status_code == 200:
             self._update_credential(credential, data)
             self.token = credential.credential
-            return 'OK'
         elif response.status_code == 400:
-            response = response.json()
-            message = response['error']
-            if 'error_description' in response:
-                message += '/' + response['error_description']
-            return 'message'
+            if data and 'errors' in data and len(data['errors']) > 0:
+                error = data['errors'][0]
+                message = ('description' in error and error['description']) or ''
+                raise BadResponseException(message)
 
     def get(self, url, extra_headers={}, exception_on_401=False):
         """Make an HTTP GET request using the active Bearer Token."""
@@ -200,7 +166,7 @@ class OdiloAPI(object):
             extra_headers = {}
         headers = dict(Authorization="Bearer %s" % self.token)
         headers.update(extra_headers)
-        status_code, headers, content = self._do_get(url, headers)
+        status_code, headers, content = self._do_get(self.library_api_base_url + url, headers)
         if status_code == 401:
             if exception_on_401:
                 # This is our second try. Give up.
@@ -223,7 +189,7 @@ class OdiloAPI(object):
         headers = dict(headers)
         headers['Authorization'] = "Basic %s" % auth
         headers['Content-Type'] = "application/x-www-form-urlencoded"
-        return self._do_post(url, payload, headers, **kwargs)
+        return self._do_post(self.library_api_base_url + url, payload, headers, **kwargs)
 
     @staticmethod
     def _update_credential(credential, odilo_data):
@@ -237,37 +203,36 @@ class OdiloAPI(object):
         if isinstance(record_id, Identifier):
             identifier = record_id.identifier
 
-        url = self.RECORD_METADATA_ENDPOINT.replace('{recordId}', identifier)
+        url = self.RECORD_METADATA_ENDPOINT.format(recordId=identifier)
 
-        response = self.get(url)
-
-        if response and response.status == 200 and response.content:
-            return response.content
+        status_code, headers, content = self.get(url)
+        if status_code == 200 and content:
+            return content
         else:
-            self.log.warn('Cannot retrieve metadata for record: ' + record_id + ' response http ' + response.status)
-            if response.content:
-                self.log.warn(response.content)
+            msg = 'Cannot retrieve metadata for record: ' + record_id + ' response http ' + status_code
+            if content:
+                msg += ' content: ' + content
+            self.log.warn(msg)
             return None
 
     def get_availability(self, record_id):
-        url = self.RECORD_AVAILABILITY_ENDPOINT.replace('{recordId}', record_id)
+        url = self.RECORD_AVAILABILITY_ENDPOINT.format(recordId=record_id)
         status_code, headers, content = self.get(url)
         content = json.loads(content)
 
         if status_code == 200 and len(content) > 0:
             return content
         else:
-            self.log.warn('Cannot retrieve availability for record: ' + record_id + ' response http ' + status_code)
+            msg = 'Cannot retrieve availability for record: ' + record_id + ' response http ' + status_code
             if content:
-                self.log.warn(content)
+                msg += ' content: ' + content
+            self.log.warn(msg)
             return None
 
     @staticmethod
     def _do_get(url, headers, **kwargs):
         # More time please
-        if not kwargs:
-            kwargs = {"timeout": 60}
-        else:
+        if 'timeout' not in kwargs:
             kwargs['timeout'] = 60
 
         if 'allow_redirects' not in kwargs:
@@ -279,9 +244,7 @@ class OdiloAPI(object):
     @staticmethod
     def _do_post(url, payload, headers, **kwargs):
         # More time please
-        if not kwargs:
-            kwargs = {"timeout": 60}
-        else:
+        if 'timeout' not in kwargs:
             kwargs['timeout'] = 60
 
         return HTTP.post_with_timeout(url, payload, headers=headers, **kwargs)
@@ -301,9 +264,53 @@ class MockOdiloAPI(OdiloAPI):
         integration = collection.create_external_integration(
             protocol=ExternalIntegration.ODILO
         )
-        integration.password = u'abcdef123hijklm'
+        integration.username = u'username'
+        integration.password = u'password'
+        integration.setting(OdiloAPI.LIBRARY_API_BASE_URL).value = u'http://library_api_base_url/api/v2'
         library.collections.append(collection)
+
         return collection
+
+    def __init__(self, _db, collection, *args, **kwargs):
+        self.access_token_requests = []
+        self.requests = []
+        self.responses = []
+
+        self.access_token_response = self.mock_access_token_response('bearer token')
+        super(MockOdiloAPI, self).__init__(_db, collection, *args, **kwargs)
+
+    def token_post(self, url, payload, headers={}, **kwargs):
+        """Mock the request for an OAuth token.
+        """
+
+        self.access_token_requests.append((url, payload, headers, kwargs))
+        response = self.access_token_response
+        return HTTP._process_response(url, response, **kwargs)
+
+    def mock_access_token_response(self, credential):
+        token = dict(token=credential, expiresIn=3600)
+        return MockRequestsResponse(200, {}, json.dumps(token))
+
+    def queue_response(self, status_code, headers={}, content=None):
+        self.responses.insert(
+            0, MockRequestsResponse(status_code, headers, content)
+        )
+
+    def _do_get(self, url, *args, **kwargs):
+        """Simulate Representation.simple_http_get."""
+        response = self._make_request(url, *args, **kwargs)
+        return response.status_code, response.headers, response.content
+
+    def _do_post(self, url, *args, **kwargs):
+        return self._make_request(url, *args, **kwargs)
+
+    def _make_request(self, url, *args, **kwargs):
+        response = self.responses.pop()
+        self.requests.append((url, args, kwargs))
+        return HTTP._process_response(
+            url, response, kwargs.get('allowed_response_codes'),
+            kwargs.get('disallowed_response_codes')
+        )
 
 
 class OdiloRepresentationExtractor(object):
@@ -312,14 +319,14 @@ class OdiloRepresentationExtractor(object):
     log = logging.getLogger("OdiloRepresentationExtractor")
 
     format_data_for_odilo_format = {
-        "ACSM": (
+        OdiloAPI.ACSM_PDF: (
             Representation.PDF_MEDIA_TYPE, DeliveryMechanism.ADOBE_DRM
         ),
-        "PDF": (
-            Representation.PDF_MEDIA_TYPE, DeliveryMechanism.STREAMING_TEXT_CONTENT_TYPE
+        OdiloAPI.ACSM_EPUB: (
+            Representation.EPUB_MEDIA_TYPE, DeliveryMechanism.ADOBE_DRM
         ),
-        "EPUB": (
-            Representation.EPUB_MEDIA_TYPE, DeliveryMechanism.STREAMING_TEXT_CONTENT_TYPE
+        OdiloAPI.EBOOK_STREAMING: (
+            Representation.TEXT_HTML_MEDIA_TYPE, DeliveryMechanism.STREAMING_TEXT_CONTENT_TYPE
         ),
         "MP3": (
             Representation.MP3_MEDIA_TYPE, DeliveryMechanism.STREAMING_AUDIO_CONTENT_TYPE
@@ -334,24 +341,24 @@ class OdiloRepresentationExtractor(object):
             Representation.JPEG_MEDIA_TYPE, DeliveryMechanism.NO_DRM
         ),
         "SCORM": (
-            Representation.ZIP_MEDIA_TYPE, DeliveryMechanism.NO_DRM
+            Representation.SCORM_MEDIA_TYPE, DeliveryMechanism.NO_DRM
         )
     }
 
     odilo_medium_to_simplified_medium = {
-        "ACSM": Edition.BOOK_MEDIUM,
-        "PDF": Edition.BOOK_MEDIUM,
-        "EPUB": Edition.BOOK_MEDIUM,
+        OdiloAPI.ACSM_PDF: Edition.BOOK_MEDIUM,
+        OdiloAPI.ACSM_EPUB: Edition.BOOK_MEDIUM,
+        OdiloAPI.EBOOK_STREAMING: Edition.BOOK_MEDIUM,
         "MP3": Edition.AUDIO_MEDIUM,
         "MP4": Edition.VIDEO_MEDIUM,
         "WMV": Edition.VIDEO_MEDIUM,
         "JPG": Edition.IMAGE_MEDIUM,
-        "SCORM": Edition.ELECTRONIC_FORMAT
+        "SCORM": Edition.COURSEWARE_MEDIUM
     }
 
     @classmethod
     def record_info_to_circulation(cls, availability):
-        """ Note:  The json data passed into this method is from a different file/stream 
+        """ Note:  The json data passed into this method is from a different file/stream
         from the json data that goes into the record_info_to_metadata() method.
         """
 
@@ -363,11 +370,17 @@ class OdiloRepresentationExtractor(object):
 
         licenses_owned = int(availability['totalCopies'])
         licenses_available = int(availability['availableCopies'])
-        if 'numLoans' in availability:
-            licenses_checked_out = int(availability['numLoans'])
-        licenses_reserved = int(availability['holdsQueueSize'])
-        if 'numPatronsInHoldQueue' in availability:
-            patrons_in_hold_queue = int(availability['numPatronsInHoldQueue'])
+
+        # 'licenses_reserved' is the number of patrons who put the book on hold earlier,
+        #  but who are now at the front of the queue and who could get the book right now if they wanted to.
+        if 'notifiedHolds' in availability:
+            licenses_reserved = int(availability['notifiedHolds'])
+        else:
+            licenses_reserved = 0
+
+        # 'patrons_in_hold_queue' contains the number of patrons who are currently waiting for a copy of the book.
+        if 'holdsQueueSize' in availability:
+            patrons_in_hold_queue = int(availability['holdsQueueSize'])
         else:
             patrons_in_hold_queue = 0
 
@@ -392,7 +405,7 @@ class OdiloRepresentationExtractor(object):
         """Turn Odilo's JSON representation of a book into a Metadata
         object.
 
-        Note:  The json data passed into this method is from a different file/stream 
+        Note:  The json data passed into this method is from a different file/stream
         from the json data that goes into the book_info_to_circulation() method.
         """
         if 'id' not in book:
@@ -411,7 +424,8 @@ class OdiloRepresentationExtractor(object):
         author = book.get('author')
         if author:
             roles = [Contributor.AUTHOR_ROLE]
-            contributor = ContributorData(sort_name=author, display_name=author, roles=roles, biography=None)
+            sort_author = display_name_to_sort_name(author)
+            contributor = ContributorData(sort_name=sort_author, display_name=author, roles=roles, biography=None)
             contributors.append(contributor)
 
         publisher = book.get('publisher')
@@ -429,7 +443,7 @@ class OdiloRepresentationExtractor(object):
                 cls.log.warn('Cannot parse publication date from: ' + published + ', message: ' + e.message)
 
         # yyyyMMdd --> record last modification date
-        last_update = book['modificationDate']
+        last_update = book.get('modificationDate')
         if last_update:
             try:
                 last_update = datetime.datetime.strptime(last_update, "%Y%m%d")
@@ -440,7 +454,10 @@ class OdiloRepresentationExtractor(object):
 
         subjects = []
         for subject in book.get('subjects', []):
-            subjects.append(SubjectData(type=Subject.TOPIC_TERM, identifier=subject, weight=100))
+            subjects.append(SubjectData(type=Subject.TAG, identifier=subject, weight=100))
+
+        for subjectBisacCode in book.get('subjectsBisacCodes', []):
+            subjects.append(SubjectData(type=Subject.BISAC, identifier=subjectBisacCode, weight=100))
 
         grade_level = book.get('gradeLevel')
         if grade_level:
@@ -448,13 +465,13 @@ class OdiloRepresentationExtractor(object):
             subjects.append(subject)
 
         medium = None
+        file_format = book.get('fileFormat')
         formats = []
         for format_received in book.get('formats', []):
             if format_received in cls.format_data_for_odilo_format:
-                content_type, drm_scheme = cls.format_data_for_odilo_format.get(format_received)
-                formats.append(FormatData(content_type, drm_scheme))
-                if not medium:
-                    medium = cls.odilo_medium_to_simplified_medium.get(format_received)
+                medium = cls.set_format(format_received, formats)
+            elif format_received == OdiloAPI.ACSM and file_format:
+                medium = cls.set_format(format_received + '_' + file_format.upper(), formats)
             else:
                 cls.log.warn('Unrecognized format received: ' + format_received)
 
@@ -464,7 +481,7 @@ class OdiloRepresentationExtractor(object):
         identifiers = []
         isbn = book.get('isbn')
         if isbn:
-            if len(isbn) == 10:
+            if isbnlib.is_isbn10(isbn):
                 isbn = isbnlib.to_isbn13(isbn)
             identifiers.append(IdentifierData(Identifier.ISBN, isbn, 1))
 
@@ -472,7 +489,13 @@ class OdiloRepresentationExtractor(object):
         links = []
         cover_image_url = book.get('coverImageUrl')
         if cover_image_url:
-            image_data = cls.image_link_to_linkdata(cover_image_url, Hyperlink.IMAGE)
+            image_data = cls.image_link_to_linkdata(cover_image_url, Hyperlink.THUMBNAIL_IMAGE)
+            if image_data:
+                links.append(image_data)
+
+        original_image_url = book.get('originalImageUrl')
+        if original_image_url:
+            image_data = cls.image_link_to_linkdata(original_image_url, Hyperlink.IMAGE)
             if image_data:
                 links.append(image_data)
 
@@ -500,9 +523,19 @@ class OdiloRepresentationExtractor(object):
         )
 
         metadata.circulation = OdiloRepresentationExtractor.record_info_to_circulation(availability)
+        # 'active' --> means that the book exists but it's no longer in the collection
+        # (it could be available again in the future)
+        if not active:
+            metadata.circulation.licenses_owned = 0
         metadata.circulation.formats = formats
 
         return metadata, active
+
+    @classmethod
+    def set_format(cls, format_received, formats):
+        content_type, drm_scheme = cls.format_data_for_odilo_format.get(format_received)
+        formats.append(FormatData(content_type, drm_scheme))
+        return cls.odilo_medium_to_simplified_medium.get(format_received)
 
 
 class OdiloBibliographicCoverageProvider(BibliographicCoverageProvider):
@@ -575,7 +608,6 @@ class OdiloBibliographicCoverageProvider(BibliographicCoverageProvider):
         identifier = self.set_metadata(identifier, metadata)
 
         # calls work.set_presentation_ready() for us
-        if is_active:
-            self.handle_success(identifier)
+        self.handle_success(identifier)
 
         return identifier, made_new
