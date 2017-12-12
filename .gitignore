@@ -20,6 +20,7 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
+node_modules/
 
 # Installer logs
 pip-log.txt
@@ -53,3 +54,7 @@ docs/_build/
 
 *~
 .env
+
+# IntelliJ
+.idea/
+*.iml
