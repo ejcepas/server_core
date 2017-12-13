@@ -115,6 +115,7 @@ from classifier import (
 from facets import FacetConstants
 from user_profile import ProfileStorage
 from util import (
+    fast_query_count,
     LanguageCodes,
     MetadataSimilarity,
     TitleProcessor,
@@ -428,6 +429,11 @@ class SessionManager(object):
         for view_name in self.MATERIALIZED_VIEWS.keys():
             _db.execute("refresh materialized view %s;" % view_name)
             _db.commit()
+        # Immediately update the number of works associated with each
+        # lane.
+        from lane import Lane
+        for lane in _db.query(Lane):
+            lane.update_size(_db)
 
     @classmethod
     def session(cls, url, initialize_data=True):
@@ -1204,7 +1210,6 @@ class DataSource(Base, HasFullTableCache):
                 (cls.OVERDRIVE, True, False, Identifier.OVERDRIVE_ID, 0),
                 (cls.BIBLIOTHECA, True, False, Identifier.BIBLIOTHECA_ID, 60*60*6),
                 (cls.ODILO, True, False, Identifier.ODILO_ID, 0),
-                (cls.THREEM, True, False, Identifier.BIBLIOTHECA_ID, 60*60*6),
                 (cls.AXIS_360, True, False, Identifier.AXIS_360_ID, 0),
                 (cls.OCLC, False, False, None, None),
                 (cls.OCLC_LINKED_DATA, False, False, None, None),
@@ -1384,6 +1389,10 @@ class CoverageRecord(Base, BaseCoverageRecord):
         else:
             raise ValueError(
                 "Cannot look up a coverage record for %r." % edition)
+
+        if isinstance(data_source, basestring):
+            data_source = DataSource.lookup(_db, data_source)
+
         return get_one(
             _db, CoverageRecord,
             identifier=identifier,
@@ -1523,9 +1532,8 @@ class WorkCoverageRecord(Base, BaseCoverageRecord):
         # The SELECT part of the INSERT...SELECT query.
         new_records = _db.query(
             Work.id.label('work_id'),
-            literal(operation, type_=BaseCoverageRecord.status_enum).label('operation'),
+            literal(operation, type_=String(255)).label('operation'),
             literal(timestamp, type_=DateTime).label('timestamp'),
-
             literal(status, type_=BaseCoverageRecord.status_enum).label('status')
         ).select_from(
             Work
@@ -1748,22 +1756,6 @@ class Identifier(Base):
         if not foreign_identifier_type or not foreign_id:
             return None
 
-        # Turn a deprecated identifier type (e.g. "3M ID" into the
-        # current type (e.g. "Bibliotheca ID").
-        foreign_identifier_type = cls.DEPRECATED_NAMES.get(
-            foreign_identifier_type, foreign_identifier_type
-        )
-
-        if foreign_identifier_type in (
-                Identifier.OVERDRIVE_ID, Identifier.BIBLIOTHECA_ID):
-            foreign_id = foreign_id.lower()
-        if not cls.valid_as_foreign_identifier(
-                foreign_identifier_type, foreign_id):
-            raise ValueError(
-                '"%s" is not a valid %s.' % (
-                    foreign_id, foreign_identifier_type
-                )
-            )
         if autocreate:
             m = get_one_or_create
         else:
@@ -2342,8 +2334,9 @@ class Identifier(Base):
         quality = Measurement.overall_quality(self.measurements)
         from opds import AcquisitionFeed
         return AcquisitionFeed.minimal_opds_entry(
-            identifier=self, cover=cover_image,
-            description=description, quality=quality)
+            identifier=self, cover=cover_image, description=description,
+            quality=quality, most_recent_update=last_coverage_update
+        )
 
 
 class Contributor(Base):
@@ -6382,8 +6375,8 @@ class CachedFeed(Base):
             length = len(self.content)
         else:
             length = "No content"
-        return "<CachedFeed #%s %s %s %s %s %s %s %s >" % (
-            self.id, self.languages, self.lane_name, self.type,
+        return "<CachedFeed #%s %s %s %s %s %s %s >" % (
+            self.id, self.lane_id, self.type,
             self.facets, self.pagination,
             self.timestamp, length
         )
@@ -10530,8 +10523,7 @@ class Collection(Base, HasFullTableCache):
     EBOOK_LOAN_DURATION_KEY = 'ebook_loan_duration'
     STANDARD_DEFAULT_LOAN_PERIOD = 21
 
-    @hybrid_property
-    def default_loan_period(self):
+    def default_loan_period(self, library, medium=Edition.BOOK_MEDIUM):
         """Until we hear otherwise from the license provider, we assume
         that someone who borrows a non-open-access item from this
         collection has it for this number of days.
@@ -10575,7 +10567,7 @@ class Collection(Base, HasFullTableCache):
     def set_default_reservation_period(self, new_value):
         new_value = int(new_value)
         self.external_integration.setting(
-            self.DEFAULT_RESERVATION_PERIOD__KEY).value = str(new_value)
+            self.DEFAULT_RESERVATION_PERIOD_KEY).value = str(new_value)
 
     def create_external_integration(self, protocol):
         """Create an ExternalIntegration for this Collection.
@@ -11093,6 +11085,14 @@ def licensepool_open_access_change(target, value, oldvalue, initiator):
         return
     work.external_index_needs_updating()
 
+def directly_modified(obj):
+    """Return True only if `obj` has itself been modified, as opposed to
+    having an object added or removed to one of its associated
+    collections.
+    """
+    return Session.object_session(obj).is_modified(
+        obj, include_collections=False
+    )
 
 # Most of the time, we can know whether a change to the database is
 # likely to require that the application reload the portion of the
