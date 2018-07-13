@@ -37,17 +37,25 @@ from sqlalchemy.orm.exc import (
     NoResultFound,
     MultipleResultsFound,
 )
-from sqlalchemy.orm.session import Session
+from sqlalchemy.orm import Session
 
 from app_server import ComplaintController
 from axis import Axis360BibliographicCoverageProvider
 from config import Configuration, CannotLoadConfiguration
+from coverage import CollectionCoverageProviderJob
 from lane import Lane
-from metadata_layer import ReplacementPolicy
+from metadata_layer import (
+    LinkData,
+    ReplacementPolicy,
+    MetaToModelUtility,
+)
+from mirror import MirrorUploader
 from model import (
+    create,
     get_one,
     get_one_or_create,
     production_session,
+    BaseCoverageRecord,
     CachedFeed,
     Collection,
     Complaint,
@@ -58,12 +66,14 @@ from model import (
     DataSource,
     Edition,
     ExternalIntegration,
+    Hyperlink,
     Identifier,
     Library,
     LicensePool,
     LicensePoolDeliveryMechanism,
     Patron,
     PresentationCalculationPolicy,
+    Representation,
     SessionManager,
     Subject,
     Timestamp,
@@ -73,8 +83,8 @@ from model import (
     site_configuration_has_changed,
 )
 from monitor import (
-    SubjectAssignmentMonitor,
     CollectionMonitor,
+    ReaperMonitor,
 )
 from opds_import import (
     OPDSImportMonitor,
@@ -84,11 +94,16 @@ from oneclick import (
     OneClickBibliographicCoverageProvider,
 )
 from overdrive import OverdriveBibliographicCoverageProvider
+from util import fast_query_count
 from util.opds_writer import OPDSFeed
 from util.personal_names import (
     contributor_name_match_ratio, 
     display_name_to_sort_name, 
     is_corporate_name
+)
+from util.worker_pools import (
+    DatabaseWorker,
+    DatabasePool,
 )
 
 from bibliotheca import (
@@ -195,45 +210,78 @@ class RunMonitorScript(Script):
             ).run()
 
 
-class RunCollectionMonitorScript(Script):
-    """Run a CollectionMonitor on every Collection that comes through a
-    certain protocol.
+class RunMultipleMonitorsScript(Script):
+    """Run a number of monitors in sequence.
 
     Currently the Monitors are run one at a time. It should be
     possible to take a command-line argument that runs all the
     Monitors in batches, each in its own thread. Unfortunately, it's
-    tough to know in a given situation that the system configuration
-    and the Collection protocol are tough enough to handle this, and
-    won't be overloaded.
+    tough to know in a given situation that this won't overload the
+    system.
     """
-    def __init__(self, monitor_class, _db=None, **kwargs):
+
+    def __init__(self, _db=None, **kwargs):
         """Constructor.
         
-        :param monitor_class: A class object that derives from 
-            CollectionMonitor.
-        :param kwargs: Keyword arguments to pass into the `monitor_class`
-            constructor each time it's called.
+        :param kwargs: Keyword arguments to pass into the `monitors` method
+            when building the Monitor objects.
         """
-        super(RunCollectionMonitorScript, self).__init__(_db)
-        self.monitor_class = monitor_class
-        self.name = self.monitor_class.SERVICE_NAME
+        super(RunMultipleMonitorsScript, self).__init__(_db)
         self.kwargs = kwargs
-        
-    def do_run(self):
-        """Instantiate a Monitor for every appropriate Collection,
-        and run them, in order.
+
+    def monitors(self, **kwargs):
+        """Find all the Monitors that need to be run.
+
+        :return: A list of Monitor objects.
         """
-        for monitor in self.monitor_class.all(self._db, **self.kwargs):
+        raise NotImplementedError()
+
+    def do_run(self):
+        """Run all appropriate monitors."""
+        for monitor in self.monitors(**self.kwargs):
             try:
                 monitor.run()
             except Exception, e:
                 # This is bad, but not so bad that we should give up trying
                 # to run the other Monitors.
+                if monitor.collection:
+                    collection_name = monitor.collection.name
+                else:
+                    collection_name = None
+                monitor.exception = e
                 self.log.error(
                     "Error running monitor %s for collection %s: %s",
-                    self.name, monitor.collection.name,
-                    e, exc_info=e
+                    self.name, collection_name, e, exc_info=e
                 )
+
+
+class RunCollectionMonitorScript(RunMultipleMonitorsScript):
+    """Run a CollectionMonitor on every Collection that comes through a
+    certain protocol.
+    """
+    def __init__(self, monitor_class, _db=None, **kwargs):
+        """Constructor.
+
+        :param monitor_class: A class object that derives from
+            CollectionMonitor.
+        :param kwargs: Keyword arguments to pass into the `monitor_class`
+            constructor each time it's called.
+        """
+        super(RunCollectionMonitorScript, self).__init__(_db, **kwargs)
+        self.monitor_class = monitor_class
+        self.name = self.monitor_class.SERVICE_NAME
+
+    def monitors(self, **kwargs):
+        return self.monitor_class.all(self._db, **kwargs)
+
+
+class RunReaperMonitorsScript(RunMultipleMonitorsScript):
+    """Run all the monitors found in ReaperMonitor.REGISTRY"""
+
+    name = "Run all reaper monitors"
+
+    def monitors(self, **kwargs):
+        return [cls(self._db, **kwargs) for cls in ReaperMonitor.REGISTRY]
 
 
 class UpdateSearchIndexScript(RunMonitorScript):
@@ -254,7 +302,8 @@ class UpdateSearchIndexScript(RunMonitorScript):
 
 class RunCoverageProvidersScript(Script):
     """Alternate between multiple coverage providers."""
-    def __init__(self, providers):
+    def __init__(self, providers, _db=None):
+        super(RunCoverageProvidersScript, self).__init__(_db=_db)
         self.providers = []
         for i in providers:
             if callable(i):
@@ -292,10 +341,74 @@ class RunCollectionCoverageProviderScript(RunCoverageProvidersScript):
         providers = providers or list()
         if provider_class:
             providers += self.get_providers(_db, provider_class, **kwargs)
-        super(RunCollectionCoverageProviderScript, self).__init__(providers)
+        super(RunCollectionCoverageProviderScript, self).__init__(providers, _db=_db)
 
     def get_providers(self, _db, provider_class, **kwargs):
         return list(provider_class.all(_db, **kwargs))
+
+
+class RunThreadedCollectionCoverageProviderScript(Script):
+    """Run coverage providers in multiple threads."""
+
+    DEFAULT_WORKER_SIZE = 5
+
+    def __init__(self, provider_class, worker_size=None, _db=None,
+        **provider_kwargs
+    ):
+        super(RunThreadedCollectionCoverageProviderScript, self).__init__(_db)
+
+        self.worker_size = worker_size or self.DEFAULT_WORKER_SIZE
+        self.session_factory = SessionManager.sessionmaker(session=self._db)
+
+        # Use a database from the factory.
+        if not _db:
+            # Close the new, autogenerated database session.
+            self._session.close()
+        self._session = self.session_factory()
+
+        self.provider_class = provider_class
+        self.provider_kwargs = provider_kwargs
+
+    def run(self, pool=None):
+        """Runs a CollectionCoverageProvider with multiple threads and
+        updates the timestamp accordingly.
+
+        :param pool: A DatabasePool (or other) object for use in testing
+        environments.
+        """
+        collections = self.provider_class.collections(self._db)
+        if not collections:
+            return
+
+        for collection in collections:
+            provider = self.provider_class(collection, **self.provider_kwargs)
+            with (
+                pool or DatabasePool(self.worker_size, self.session_factory)
+            ) as job_queue:
+                query_size, batch_size = self.get_query_and_batch_sizes(
+                    provider
+                )
+                # Without a commit, the query to count which items need
+                # coverage hangs in the database, blocking the threads.
+                self._db.commit()
+
+                offset = 0
+                while offset < query_size:
+                    job = CollectionCoverageProviderJob(
+                        collection, self.provider_class, offset,
+                        **self.provider_kwargs
+                    )
+                    job_queue.put(job)
+                    offset += batch_size
+
+            # Now that all the work is done, update the timestamp.
+            provider.update_timestamp()
+
+    def get_query_and_batch_sizes(self, provider):
+        qu = provider.items_that_need_coverage(
+            count_as_covered=BaseCoverageRecord.DEFAULT_COUNT_AS_COVERED
+        )
+        return fast_query_count(qu), provider.batch_size
 
 
 class RunWorkCoverageProviderScript(RunCollectionCoverageProviderScript):
@@ -606,16 +719,18 @@ class LaneSweeperScript(LibraryInputScript):
     """Do something to each lane in a library."""
 
     def process_library(self, library):
-        queue = self._db.query(Lane).filter(
-            Lane.library==library).filter(
-                Lane.parent==None).all()
+        from lane import WorkList
+        top_level = WorkList.top_level_for_library(self._db, library)
+        queue = [top_level]
         while queue:
             new_queue = []
             for l in queue:
+                if isinstance(l, Lane):
+                    l = self._db.merge(l)
                 if self.should_process_lane(l):
                     self.process_lane(l)
                     self._db.commit()
-                for sublane in l.sublanes:
+                for sublane in l.children:
                     new_queue.append(sublane)
             queue = new_queue
 
@@ -735,11 +850,11 @@ class BibliographicRefreshScript(RunCollectionCoverageProviderScript, Identifier
     )
 
     def __init__(self, _db=None, **metadata_replacement_args):
-        replacement_policy = ReplacementPolicy.from_metadata_source(
+        self.replacement_policy = ReplacementPolicy.from_metadata_source(
             **metadata_replacement_args
         )
-        kwargs = dict(replacement_policy=replacement_policy)
 
+        kwargs = dict(replacement_policy=self.replacement_policy)
         providers = list()
         _db = _db or self._db
         for provider_class in self.PROVIDER_CLASSES:
@@ -1267,6 +1382,116 @@ class ConfigureIntegrationScript(ConfigurationSettingScript):
         output.write("\n")
 
         
+class ShowLanesScript(Script):
+    """Show information about the lanes on a server."""
+    
+    name = "List the lanes on this server."
+    @classmethod
+    def arg_parser(cls):
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            '--id',
+            help='Only display information for the lane with the given ID',
+        )
+        return parser
+    
+    def do_run(self, _db=None, cmd_args=None, output=sys.stdout):
+        _db = _db or self._db
+        args = self.parse_command_line(_db, cmd_args=cmd_args)
+        if args.id:
+            id = args.id
+            lane = get_one(_db, Lane, id=id)
+            if lane:
+                lanes = [lane]
+            else:
+                output.write(
+                    "Could not locate lane with id: %s" % id
+                )
+                lanes = []
+        else:
+            lanes = _db.query(Lane).order_by(Lane.id).all()
+        if not lanes:
+            output.write("No lanes found.\n")
+        for lane in lanes:
+            output.write(
+                "\n".join(
+                    lane.explain()
+                )
+            )
+            output.write("\n\n")
+
+class ConfigureLaneScript(ConfigurationSettingScript):
+    """Create a lane or change its settings."""
+    name = "Change a lane's settings"
+
+    @classmethod
+    def parse_command_line(cls, _db=None, cmd_args=None):
+        parser = cls.arg_parser(_db)
+        return parser.parse_known_args(cmd_args)[0]
+    
+    @classmethod
+    def arg_parser(cls, _db):
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            '--id',
+            help='ID of the lane, if editing an existing lane.',
+        )
+        parser.add_argument(
+            '--library-short-name',
+            help='Short name of the library for this lane. Possible values: %s' % cls._library_names(_db),
+        )
+        parser.add_argument(
+            '--parent-id',
+            help="The ID of this lane's parent lane",
+        )
+        parser.add_argument(
+            '--priority',
+            help="The lane's priority",
+        )
+        parser.add_argument(
+            '--display-name',
+            help='The lane name that will be displayed to patrons.',
+        )
+        return parser
+
+    @classmethod
+    def _library_names(self, _db):
+        """Return a string that lists known library names."""
+        library_names = [x.short_name for x in _db.query(
+            Library).order_by(Library.short_name)
+        ]
+        if library_names:
+            return '"' + '", "'.join(library_names) + '"'
+        return ""
+    
+    def do_run(self, _db=None, cmd_args=None, output=sys.stdout):
+        _db = _db or self._db
+        args = self.parse_command_line(_db, cmd_args=cmd_args)
+
+        # Find or create the lane
+        id = args.id
+        lane = get_one(_db, Lane, id=id)
+        if not lane:
+            if args.library_short_name:
+                library = get_one(_db, Library, short_name=args.library_short_name)
+                if not library:
+                    raise ValueError("No such library: \"%s\"." % args.library_short_name)
+                lane, is_new = create(_db, Lane, library=library)
+            else:
+                raise ValueError("Library short name is required to create a new lane.")
+
+        if args.parent_id:
+            lane.parent_id = args.parent_id
+        if args.priority:
+            lane.priority = args.priority
+        if args.display_name:
+            lane.display_name = args.display_name
+        site_configuration_has_changed(_db)
+        _db.commit()
+        output.write("Lane settings stored.\n")
+        output.write("\n".join(lane.explain()))
+        output.write("\n")
+
 class AddClassificationScript(IdentifierInputScript):
     name = "Add a classification to an identifier"
 
@@ -1601,7 +1826,14 @@ class OPDSImportScript(CollectionInputScript):
     IMPORTER_CLASS = OPDSImporter
     MONITOR_CLASS = OPDSImportMonitor
     PROTOCOL = ExternalIntegration.OPDS_IMPORT
-    
+
+    def __init__(self, _db=None, importer_class=None, monitor_class=None, 
+                 protocol=None, *args, **kwargs):
+        super(OPDSImportScript, self).__init__(_db, *args, **kwargs)
+        self.importer_class = importer_class or self.IMPORTER_CLASS
+        self.monitor_class = monitor_class or self.MONITOR_CLASS
+        self.protocol = protocol or self.PROTOCOL
+
     @classmethod
     def arg_parser(cls):
         parser = CollectionInputScript.arg_parser()
@@ -1614,16 +1846,152 @@ class OPDSImportScript(CollectionInputScript):
     
     def do_run(self, cmd_args=None):
         parsed = self.parse_command_line(self._db, cmd_args=cmd_args)
-        collections = parsed.collections or Collection.by_protocol(self._db, self.PROTOCOL)
+        collections = parsed.collections or Collection.by_protocol(self._db, self.protocol)
         for collection in collections:
             self.run_monitor(collection, force=parsed.force)
 
     def run_monitor(self, collection, force=None):
-        monitor = self.MONITOR_CLASS(
-            self._db, collection, import_class=self.IMPORTER_CLASS,
+        monitor = self.monitor_class(
+            self._db, collection, import_class=self.importer_class,
             force_reimport=force
         )
         monitor.run()
+
+
+class MirrorResourcesScript(CollectionInputScript):
+    """Make sure that all mirrorable resources in a collection have
+    in fact been mirrored.
+    """
+
+    # This object contains the actual logic of mirroring.
+    MIRROR_UTILITY = MetaToModelUtility()
+
+    def do_run(self, cmd_args=None):
+        parsed = self.parse_command_line(self._db, cmd_args=cmd_args)
+        collections = parsed.collections
+        if not collections:
+            # Assume they mean all collections.
+            collections = self._db.query(Collection).all()
+
+        # But only process collections that have an associated MirrorUploader.
+        for collection, policy in self.collections_with_uploader(collections):
+            self.process_collection(collection, policy)
+
+    def collections_with_uploader(self, collections):
+        """Filter out collections that have no MirrorUploader.
+
+        :yield: 2-tuples (Collection, ReplacementPolicy). The
+            ReplacementPolicy is the appropriate one for this script
+            to use for that Collection.
+        """
+        for collection in collections:
+            uploader = MirrorUploader.for_collection(collection)
+            if uploader:
+                policy = self.replacement_policy(uploader)
+                yield collection, policy
+            else:
+                self.log.info(
+                    "Skipping %r as it has no MirrorUploader.", collection
+                )
+
+    @classmethod
+    def replacement_policy(cls, uploader):
+        """Create a ReplacementPolicy for this script that uses the
+        given uploader.
+        """
+        return ReplacementPolicy(
+            mirror=uploader, link_content=True,
+            even_if_not_apparently_updated=True,
+            http_get=Representation.cautious_http_get,
+        )
+
+    def process_collection(self, collection, policy, unmirrored=None):
+        """Make sure every mirrorable resource in this collection has
+        been mirrored.
+
+        :param unmirrored: A replacement for Hyperlink.unmirrored,
+        for use in tests.
+        """
+        unmirrored = unmirrored or Hyperlink.unmirrored
+        for link in unmirrored(collection):
+            self.process_item(collection, link, policy)
+            self._db.commit()
+
+    @classmethod
+    def derive_rights_status(cls, license_pool, resource):
+        """Make a best guess about the rights status for the given
+        resource.
+
+        This relies on the information having been available at one point,
+        but having been stored in the database at a slight remove.
+        """
+        rights_status = None
+        if not license_pool:
+            return None
+        if resource:
+            lpdm = resource.as_delivery_mechanism_for(license_pool)
+            # When this Resource was associated with this LicensePool,
+            # the rights information was recorded in its
+            # LicensePoolDeliveryMechanism.
+            if lpdm:
+                rights_status = lpdm.rights_status
+        if not rights_status:
+            # We could not find a LicensePoolDeliveryMechanism for
+            # this particular resource, but if every
+            # LicensePoolDeliveryMechanism has the same rights
+            # status, we can assume it's that one.
+            statuses = list(set([
+                x.rights_status for x in license_pool.delivery_mechanisms
+            ]))
+            if len(statuses) == 1:
+                [rights_status] = statuses
+        if rights_status:
+            rights_status = rights_status.uri
+        return rights_status
+
+    def process_item(self, collection, link_obj, policy):
+        """Determine the URL that needs to be mirrored and (for books)
+        the rationale that lets us mirror that URL. Then mirror it.
+        """
+        identifier = link_obj.identifier
+        license_pool, ignore = LicensePool.for_foreign_id(
+            self._db, collection.data_source,
+            identifier.type, identifier.identifier,
+            collection=collection, autocreate=False
+        )
+        if not license_pool:
+            # This shouldn't happen.
+            self.log.warn(
+                "Could not find LicensePool for %r, skipping it rather than mirroring something we shouldn't."
+            )
+            return
+        resource = link_obj.resource
+
+        if link_obj.rel == Hyperlink.OPEN_ACCESS_DOWNLOAD:
+            rights_status = self.derive_rights_status(license_pool, resource)
+            if not rights_status:
+                self.log.warn(
+                    "Could not unambiguously determine rights status for %r, skipping.", link_obj
+                )
+                return
+        else:
+            # For resources like book covers, the rights status is
+            # irrelevant -- we rely on fair use.
+            rights_status = None
+
+        # Mock up a LinkData that MetaToModelUtility can use to
+        # mirror this link (or decide not to mirror it).
+        linkdata = LinkData(
+            rel=link_obj.rel,
+            href=resource.url,
+            rights_uri=rights_status
+        )
+
+        # Mirror the link (or not).
+        self.MIRROR_UTILITY.mirror_link(
+            model_object=license_pool, data_source=collection.data_source,
+            link=linkdata, link_obj=link_obj, policy=policy
+        )
 
 
 class RefreshMaterializedViewsScript(Script):
@@ -1645,34 +2013,43 @@ class RefreshMaterializedViewsScript(Script):
             concurrently = ''
         else:
             concurrently = 'CONCURRENTLY'
-        # Initialize database
-        from model import (
-            MaterializedWork,
-            MaterializedWorkWithGenre,
-        )
+
+        # Initialize the default database session. We can't use this
+        # session to run the VACUUM commands, because it wraps
+        # everything in a big transaction, and VACUUM can't be
+        # executed within a transaction block. But we will use it at
+        # the end, to recalculate the sizes of lanes.
         db = self._db
-        for i in (MaterializedWork, MaterializedWorkWithGenre):
-            view_name = i.__table__.name
-            a = time.time()
-            db.execute("REFRESH MATERIALIZED VIEW %s %s" % (concurrently, view_name))
-            b = time.time()
-            print "%s refreshed in %.2f sec." % (view_name, b-a)
 
-        # Close out this session because we're about to create another one.
-        db.commit()
-        db.close()
-
-        # The normal database connection (which we want almost all the
-        # time) wraps everything in a big transaction, but VACUUM
-        # can't be executed within a transaction block. So create a
-        # separate connection that uses autocommit.
         url = Configuration.database_url()
         engine = create_engine(url, isolation_level="AUTOCOMMIT")
         engine.autocommit = True
         a = time.time()
         engine.execute("VACUUM (VERBOSE, ANALYZE)")
         b = time.time()
-        print "Vacuumed in %.2f sec." % (b-a)
+        self.log.info("Database vacuumed in %.2f sec." % (b-a))
+
+        for view_name in SessionManager.MATERIALIZED_VIEWS.keys():
+            a = time.time()
+            engine.execute("REFRESH MATERIALIZED VIEW %s %s" % (concurrently, view_name))
+            b = time.time()
+            self.log.info("%s refreshed in %.2f sec.", view_name, b-a)
+
+            # Vacuum the materialized view immediately after
+            # refreshing it.
+            a = time.time()
+            engine.execute("VACUUM ANALYZE %s" % view_name)
+            b = time.time()
+            self.log.info("%s vacuumed in %.2f sec", view_name, b-a)
+
+        # Recalculate the sizes of lanes.
+        for lane in db.query(Lane):
+            lane.update_size(db)
+            self.log.info(
+                "Size of lane %s calculated as %s",
+                lane.full_identifier, lane.size
+            )
+        db.commit()
 
 
 class DatabaseMigrationScript(Script):
@@ -2391,6 +2768,11 @@ class CheckContributorNamesInDB(IdentifierInputScript):
 
 class Explain(IdentifierInputScript):
     """Explain everything known about a given work."""
+
+    # Where to go to get best available metadata about a work.
+    METADATA_URL_TEMPLATE = "http://metadata.librarysimplified.org/lookup?urn=%s"
+    TIME_FORMAT = "%Y-%m-%d %H:%M"
+
     def do_run(self, cmd_args=None, stdin=sys.stdin, stdout=sys.stdout):
         param_args = self.parse_command_line(self._db, cmd_args=cmd_args, stdin=stdin)
         identifier_ids = [x.id for x in param_args.identifiers]
@@ -2421,7 +2803,7 @@ class Explain(IdentifierInputScript):
         output = "%s (%s, %s) according to %s" % (edition.title, edition.author, edition.medium, edition.data_source.name)
         self.write(output)
         self.write(" Permanent work ID: %s" % edition.permanent_work_id)
-        self.write(" Metadata URL: http://metadata.alpha.librarysimplified.org/lookup?urn=%s" % edition.primary_identifier.urn)
+        self.write(" Metadata URL: %s " % (self.METADATA_URL_TEMPLATE % edition.primary_identifier.urn))
 
         seen = set()
         self.explain_identifier(edition.primary_identifier, True, seen, 1, 0)
@@ -2494,9 +2876,24 @@ class Explain(IdentifierInputScript):
             output = equivalency.output
             self.explain_identifier(output, False, seen,
                                     equivalency.strength, level+1)
+        if primary:
+            crs = identifier.coverage_records
+            if crs:
+                self.write("  %d coverage records:" % len(crs))
+                for cr in sorted(crs, key=lambda x: x.timestamp):
+                    self.explain_coverage_record(cr)
 
     def explain_license_pool(self, pool):
         self.write("Licensepool info:")
+        if pool.collection:
+            self.write(" Collection: %r" % pool.collection)
+            libraries = [library.name for library in pool.collection.libraries]
+            if libraries:
+                self.write(" Available to libraries: %s" % ", ".join(libraries))
+            else:
+                self.write("Not available to any libraries!")
+        else:
+            self.write(" Not in any collection!")
         self.write(" Delivery mechanisms:")
         if pool.delivery_mechanisms:
             for lpdm in pool.delivery_mechanisms:
@@ -2529,7 +2926,47 @@ class Explain(IdentifierInputScript):
             active = "SUPERCEDED"
             if not pool.superceded:
                 active = "ACTIVE"
-            self.write("  %s: %r" % (active, pool.identifier))
+            if pool.collection:
+                collection = pool.collection.name
+            else:
+                collection = '!collection'
+            self.write("  %s: %r %s" % (active, pool.identifier, collection))
+        wcrs = sorted(work.coverage_records, key=lambda x: x.timestamp)
+        if wcrs:
+            self.write(" %s work coverage records" % len(wcrs))
+            for wcr in wcrs:
+                self.explain_work_coverage_record(wcr)
+
+    def explain_coverage_record(self, cr):
+        self._explain_coverage_record(
+            cr.timestamp, cr.data_source, cr.operation, cr.status,
+            cr.exception
+        )
+
+    def explain_work_coverage_record(self, cr):
+        self._explain_coverage_record(
+            cr.timestamp, None, cr.operation, cr.status, cr.exception
+        )
+
+    def _explain_coverage_record(self, timestamp, data_source, operation,
+                                 status, exception):
+        timestamp = timestamp.strftime(self.TIME_FORMAT)
+        if data_source:
+            data_source = data_source.name + ' | '
+        else:
+            data_source = ''
+        if operation:
+            operation = operation + ' | '
+        else:
+            operation = ''
+        if exception:
+            exception = ' | ' + exception
+        else:
+            exception = ''
+        self.write("   %s | %s%s%s%s" % (
+            timestamp, data_source, operation, status,
+            exception
+        ))
 
 
 class FixInvisibleWorksScript(CollectionInputScript):
@@ -2548,6 +2985,7 @@ class FixInvisibleWorksScript(CollectionInputScript):
         self.do_run(parsed.collections)
 
     def do_run(self, collections=None):
+        self.check_libraries()
         if collections:
             collection_ids = [c.id for c in collections]
 
@@ -2584,11 +3022,11 @@ class FixInvisibleWorksScript(CollectionInputScript):
             return
 
         # See how many works are in the materialized view.
-        from model import MaterializedWork
-        mv_works = self._db.query(MaterializedWork)
+        from model import MaterializedWorkWithGenre as work_model
+        mv_works = self._db.query(work_model)
 
         if collections:
-            mv_works = mv_works.filter(MaterializedWork.collection_id.in_(collection_ids))
+            mv_works = mv_works.filter(work_model.collection_id.in_(collection_ids))
 
         mv_works_count = mv_works.count()
         self.output.write(
@@ -2615,8 +3053,8 @@ class FixInvisibleWorksScript(CollectionInputScript):
         LPDM = LicensePoolDeliveryMechanism
         mv_works = mv_works.filter(
             exists().where(
-                and_(MaterializedWork.data_source_id==LPDM.data_source_id,
-                     MaterializedWork.identifier_id==LPDM.identifier_id)
+                and_(work_model.data_source_id==LPDM.data_source_id,
+                     work_model.identifier_id==LPDM.identifier_id)
             )
         )
         if mv_works.count() == 0:
@@ -2659,15 +3097,34 @@ class FixInvisibleWorksScript(CollectionInputScript):
             "I would now expect you to be able to find %d works.\n" % mv_works_count
         )
 
-class SubjectAssignmentScript(SubjectInputScript):
+    def check_libraries(self):
+        """Make sure the libraries are equipped to show works.
+        """
+        # Check each library.
+        libraries = self._db.query(Library).all()
+        if libraries:
+            for library in libraries:
+                self.check_library(library)
+        else:
+            self.output.write("There are no libraries in the system -- that's a problem.\n")
+        self.output.write("\n")
 
-    def do_run(self):
-        args = self.parse_command_line(self._db)
-        monitor = SubjectAssignmentMonitor(
-            self._db, args.subject_type, args.subject_filter
-        )
-        monitor.run()
+    def check_library(self, library):
+        """Make sure a library is properly set up to show works."""
+        self.output.write("Checking library %s\n" % library.name)
 
+        # Make sure it has collections.
+        if not library.collections:
+            self.output.write(" This library has no collections -- that's a problem.\n")
+        else:
+            for collection in library.collections:
+                self.output.write(" Associated with collection %s.\n" % collection.name)
+
+        # Make sure it has lanes.
+        if not library.lanes:
+            self.output.write(" This library has no lanes -- that's a problem.\n")
+        else:
+            self.output.write(" Associated with %s lanes.\n" % len(library.lanes))
 
 class ListCollectionMetadataIdentifiersScript(CollectionInputScript):
     """List the metadata identifiers for Collections in the database.

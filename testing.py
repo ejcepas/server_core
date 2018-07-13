@@ -381,6 +381,8 @@ class DatabaseTest(object):
             parent=parent, display_name=display_name,
             create_method_kwargs=dict(fiction=fiction)
         )
+        if is_new and parent:
+            lane.priority = len(parent.sublanes)-1
         if genres:
             if not isinstance(genres, list):
                 genres = [genres]
@@ -417,7 +419,8 @@ class DatabaseTest(object):
         )
 
     def _coverage_record(self, edition, coverage_source, operation=None,
-                         status=CoverageRecord.SUCCESS, collection=None):
+        status=CoverageRecord.SUCCESS, collection=None, exception=None,
+    ):
         if isinstance(edition, Identifier):
             identifier = edition
         else:
@@ -431,6 +434,7 @@ class DatabaseTest(object):
             create_method_kwargs = dict(
                 timestamp=datetime.utcnow(),
                 status=status,
+                exception=exception,
             )
         )
         return record
@@ -911,6 +915,19 @@ class DatabaseTest(object):
             data_source=data_source, weight=weight
         )[0]
 
+    def sample_cover_path(self, name):
+        """The path to the sample cover with the given filename."""
+        base_path = os.path.split(__file__)[0]
+        resource_path = os.path.join(base_path, "tests", "files", "covers")
+        sample_cover_path = os.path.join(resource_path, name)
+        return sample_cover_path
+
+    def sample_cover_representation(self, name):
+        """A Representation of the sample cover with the given filename."""
+        sample_cover_path = self.sample_cover_path(name)
+        return self._representation(
+            media_type="image/png", content=open(sample_cover_path).read())[0]
+
 
 class MockCoverageProvider(object):
     """Mixin class for mock CoverageProviders that defines common constants."""
@@ -961,7 +978,11 @@ class AlwaysSuccessfulCollectionCoverageProvider(MockCoverageProvider,
                                                  CollectionCoverageProvider):
     """A CollectionCoverageProvider that does nothing and always succeeds."""
     SERVICE_NAME = "Always successful (collection)"
-    
+
+    def process_item(self, item):
+        return item
+
+
 class AlwaysSuccessfulCoverageProvider(InstrumentedCoverageProvider):
     """A CoverageProvider that does nothing and always succeeds."""
     SERVICE_NAME = "Always successful"
@@ -1081,6 +1102,9 @@ class DummyHTTPClient(object):
 
     def queue_response(self, response_code, media_type="text/html",
                        other_headers=None, content=''):
+        """Queue a response of the type produced by
+        Representation.simple_http_get.
+        """
         headers = {}
         if media_type:
             headers["content-type"] = media_type
@@ -1088,6 +1112,17 @@ class DummyHTTPClient(object):
             for k, v in other_headers.items():
                 headers[k.lower()] = v
         self.responses.append((response_code, headers, content))
+
+    def queue_requests_response(
+            self, response_code, media_type="text/html",
+            other_headers=None, content=''
+    ):
+        """Queue a response of the type produced by HTTP.get_with_timeout."""
+        headers = dict(other_headers or {})
+        if media_type:
+            headers['Content-Type'] = media_type
+        response = MockRequestsResponse(response_code, headers, content)
+        self.responses.append(response)
 
     def do_get(self, url, *args, **kwargs):
         self.requests.append(url)

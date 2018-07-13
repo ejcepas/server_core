@@ -19,6 +19,7 @@ import os
 import random
 import re
 import requests
+from threading import RLock
 import time
 import traceback
 import urllib
@@ -54,6 +55,7 @@ from sqlalchemy.orm import (
     sessionmaker,
     synonym,
 )
+from sqlalchemy.orm.base import NO_VALUE
 from sqlalchemy.orm.exc import (
     NoResultFound,
     MultipleResultsFound,
@@ -103,7 +105,10 @@ from sqlalchemy import (
 )
 
 import log # Make sure logging is set up properly.
-from config import Configuration
+from config import (
+    Configuration,
+    CannotLoadConfiguration,
+)
 import classifier
 from classifier import (
     Classifier,
@@ -112,6 +117,7 @@ from classifier import (
     GenreData,
     WorkClassifier,
 )
+from entrypoint import EntryPoint
 from facets import FacetConstants
 from user_profile import ProfileStorage
 from util import (
@@ -120,6 +126,7 @@ from util import (
     MetadataSimilarity,
     TitleProcessor,
 )
+from mirror import MirrorUploader
 from util.http import (
     HTTP,
     RemoteIntegrationException,
@@ -312,9 +319,11 @@ class SessionManager(object):
 
     MATERIALIZED_VIEW_WORKS = 'mv_works_editions_datasources_identifiers'
     MATERIALIZED_VIEW_WORKS_WORKGENRES = 'mv_works_editions_workgenres_datasources_identifiers'
+    MATERIALIZED_VIEW_LANES = 'mv_works_for_lanes'
     MATERIALIZED_VIEWS = {
-        MATERIALIZED_VIEW_WORKS : 'materialized_view_works.sql',
-        MATERIALIZED_VIEW_WORKS_WORKGENRES : 'materialized_view_works_workgenres.sql',
+        #MATERIALIZED_VIEW_WORKS : 'materialized_view_works.sql',
+        #MATERIALIZED_VIEW_WORKS_WORKGENRES : 'materialized_view_works_workgenres.sql',
+        MATERIALIZED_VIEW_LANES : 'materialized_view_for_lanes.sql',
     }
 
     # A function that calculates recursively equivalent identifiers
@@ -329,12 +338,22 @@ class SessionManager(object):
         return create_engine(url, echo=DEBUG)
 
     @classmethod
-    def sessionmaker(cls, url=None):
-        engine = cls.engine(url)
-        return sessionmaker(bind=engine)
+    def sessionmaker(cls, url=None, session=None):
+        if not (url or session):
+            url = Configuration.database_url()
+        if url:
+            bind_obj = cls.engine(url)
+        elif session:
+            bind_obj = session.get_bind()
+            if not os.environ.get('TESTING'):
+                # If a factory is being created from a session in test mode,
+                # use the same Connection for all of the tests so objects can
+                # be accessed. Otherwise, bind against an Engine object.
+                bind_obj = bind_obj.engine
+        return sessionmaker(bind=bind_obj)
 
     @classmethod
-    def initialize(cls, url):
+    def initialize(cls, url, create_materialized_work_class=True):
         if url in cls.engine_for_url:
             engine = cls.engine_for_url[url]
             return engine, engine.connect()
@@ -358,7 +377,16 @@ class SessionManager(object):
                 "Loading materialized view %s from %s.",
                 view_name, resource_file)
             sql = open(resource_file).read()
-            connection.execute(sql)
+            connection.execution_options(isolation_level='AUTOCOMMIT')\
+                .execute(text(sql))
+
+            # NOTE: This is apparently necessary for the creation of
+            # the materialized view to be finalized in all cases. As
+            # such, materialized views should be created WITH NO DATA,
+            # since they will be refreshed immediately after creation.
+            result = connection.execute(
+                "REFRESH MATERIALIZED VIEW %s;" % view_name
+            )
 
         if not connection:
             connection = engine.connect()
@@ -385,42 +413,34 @@ class SessionManager(object):
         if connection:
             connection.close()
 
-        class MaterializedWorkWithGenre(Base, BaseMaterializedWork):
-            __table__ = Table(
-                cls.MATERIALIZED_VIEW_WORKS_WORKGENRES,
-                Base.metadata,
-                Column('works_id', Integer, primary_key=True),
-                Column('workgenres_id', Integer, primary_key=True),
-                Column('license_pool_id', Integer, ForeignKey('licensepools.id')),
-                autoload=True,
-                autoload_with=engine
-            )
-            license_pool = relationship(
-                LicensePool,
-                primaryjoin="LicensePool.id==MaterializedWorkWithGenre.license_pool_id",
-                foreign_keys=LicensePool.id, lazy='joined', uselist=False)
+        if create_materialized_work_class:
+            class MaterializedWorkWithGenre(Base, BaseMaterializedWork):
+                __table__ = Table(
+                    cls.MATERIALIZED_VIEW_LANES,
+                    Base.metadata,
+                    Column('works_id', Integer, primary_key=True, index=True),
+                    Column('workgenres_id', Integer, primary_key=True, index=True),
+                    Column('list_id', Integer, ForeignKey('customlists.id'),
+                           primary_key=True, index=True),
+                    Column(
+                        'list_edition_id', Integer, ForeignKey('editions.id'),
+                        primary_key=True, index=True
+                    ),
+                    Column(
+                        'license_pool_id', Integer,
+                        ForeignKey('licensepools.id'), primary_key=True,
+                        index=True
+                    ),
+                    autoload=True,
+                    autoload_with=engine
+                )
+                license_pool = relationship(
+                    LicensePool,
+                    primaryjoin="LicensePool.id==MaterializedWorkWithGenre.license_pool_id",
+                    foreign_keys=LicensePool.id, lazy='joined', uselist=False)
 
-        class MaterializedWork(Base, BaseMaterializedWork):
-            __table__ = Table(
-                cls.MATERIALIZED_VIEW_WORKS,
-                Base.metadata,
-                Column('works_id', Integer, primary_key=True),
-                Column('license_pool_id', Integer, ForeignKey('licensepools.id')),
-              autoload=True,
-                autoload_with=engine
-            )
-            license_pool = relationship(
-                LicensePool,
-                primaryjoin="LicensePool.id==MaterializedWork.license_pool_id",
-                foreign_keys=LicensePool.id, lazy='joined', uselist=False)
+            globals()['MaterializedWorkWithGenre'] = MaterializedWorkWithGenre
 
-            def __repr__(self):
-                return (u'%s "%s" (%s) %s' % (
-                    self.works_id, self.sort_title, self.sort_author, self.language,
-                    )).encode("utf8")
-
-        globals()['MaterializedWork'] = MaterializedWork
-        globals()['MaterializedWorkWithGenre'] = MaterializedWorkWithGenre
         cls.engine_for_url[url] = engine
         return engine, engine.connect()
 
@@ -440,7 +460,9 @@ class SessionManager(object):
         engine = connection = 0
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=sa_exc.SAWarning)
-            engine, connection = cls.initialize(url)
+            engine, connection = cls.initialize(
+                url, create_materialized_work_class=initialize_data
+            )
         session = Session(connection)
         if initialize_data:
             session = cls.initialize_data(session)
@@ -689,7 +711,7 @@ class Patron(Base):
     def can_borrow(self, work, policy):
         """Return true if the given policy allows this patron to borrow the
         given work.
-        
+
         This will return False when the policy for this patron's
         .external_type prevents access to this book's audience.
         """
@@ -711,7 +733,7 @@ class Patron(Base):
         return self._synchronize_annotations
 
     @synchronize_annotations.setter
-    def _set_synchronize_annotations(self, value):
+    def synchronize_annotations(self, value):
         """When a patron says they don't want their annotations to be stored
         on a library server, delete all their annotations.
         """
@@ -769,7 +791,7 @@ class PatronProfileStorage(ProfileStorage):
 
     def update(self, settable, full):
         """Bring the Patron's status up-to-date with the given document.
-        
+
         Right now this means making sure Patron.synchronize_annotations
         is up to date.
         """
@@ -792,15 +814,24 @@ class LoanAndHoldMixin(object):
             return license_pool.presentation_edition.work
         return None
 
+    @property
+    def library(self):
+        """Try to find the corresponding library for this Loan/Hold."""
+        if self.patron:
+            return self.patron.library
+        # If this Loan/Hold belongs to a external patron, there may be no library.
+        return None
+
 
 class Loan(Base, LoanAndHoldMixin):
     __tablename__ = 'loans'
     id = Column(Integer, primary_key=True)
     patron_id = Column(Integer, ForeignKey('patrons.id'), index=True)
+    integration_client_id = Column(Integer, ForeignKey('integrationclients.id'), index=True)
     license_pool_id = Column(Integer, ForeignKey('licensepools.id'), index=True)
     fulfillment_id = Column(Integer, ForeignKey('licensepooldeliveries.id'))
-    start = Column(DateTime)
-    end = Column(DateTime)
+    start = Column(DateTime, index=True)
+    end = Column(DateTime, index=True)
     # Some distributors (e.g. Feedbooks) may have an identifier that can
     # be used to check the status of a specific Loan.
     external_identifier = Column(Unicode, unique=True, nullable=True)
@@ -825,10 +856,12 @@ class Hold(Base, LoanAndHoldMixin):
     __tablename__ = 'holds'
     id = Column(Integer, primary_key=True)
     patron_id = Column(Integer, ForeignKey('patrons.id'), index=True)
+    integration_client_id = Column(Integer, ForeignKey('integrationclients.id'), index=True)
     license_pool_id = Column(Integer, ForeignKey('licensepools.id'), index=True)
     start = Column(DateTime, index=True)
     end = Column(DateTime, index=True)
     position = Column(Integer, index=True)
+    external_identifier = Column(Unicode, unique=True, nullable=True)
 
     @classmethod
     def _calculate_until(
@@ -887,8 +920,9 @@ class Hold(Base, LoanAndHoldMixin):
         this--the library's license might expire and then you'll
         _never_ get the book.)
         """
-        if self.end:
-            # Whew, the server provided its own estimate.
+        if self.end and self.end > datetime.datetime.utcnow():
+            # The license source provided their own estimate, and it's
+            # not obviously wrong, so use it.
             return self.end
 
         if default_reservation_period is None:
@@ -915,10 +949,8 @@ class Hold(Base, LoanAndHoldMixin):
         """
         if start is not None:
             self.start = start
-        if position == 0 and end is not None:
+        if end is not None:
             self.end = end
-        else:
-            self.end = None
         if position is not None:
             self.position = position
 
@@ -1263,6 +1295,9 @@ class BaseCoverageRecord(object):
 
     ALL_STATUSES = [REGISTERED, SUCCESS, TRANSIENT_FAILURE, PERSISTENT_FAILURE]
 
+    # Count coverage as attempted if the record is not 'registered'.
+    PREVIOUSLY_ATTEMPTED = [SUCCESS, TRANSIENT_FAILURE, PERSISTENT_FAILURE]
+
     # By default, count coverage as present if it ended in
     # success or in persistent failure. Do not count coverage
     # as present if it ended in transient failure.
@@ -1360,6 +1395,11 @@ class CoverageRecord(Base, BaseCoverageRecord):
     )
 
     def __repr__(self):
+        template = '<CoverageRecord: %(timestamp)s identifier=%(identifier_type)s/%(identifier)s data_source="%(data_source)s"%(operation)s status="%(status)s" %(exception)s>'
+        return self.human_readable(template)
+
+    def human_readable(self, template):
+        """Interpolate data into a human-readable template."""
         if self.operation:
             operation = ' operation="%s"' % self.operation
         else:
@@ -1368,15 +1408,16 @@ class CoverageRecord(Base, BaseCoverageRecord):
             exception = ' exception="%s"' % self.exception
         else:
             exception = ''
-        template = '<CoverageRecord: identifier=%s/%s data_source="%s"%s timestamp="%s"%s>'
-        return template % (
-            self.identifier.type,
-            self.identifier.identifier,
-            self.data_source.name,
-            operation,
-            self.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            exception
+        return template % dict(
+            timestamp=self.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            identifier_type=self.identifier.type,
+            identifier=self.identifier.identifier,
+            data_source=self.data_source.name,
+            operation=operation,
+            status=self.status,
+            exception=exception,
         )
+
 
     @classmethod
     def lookup(cls, edition_or_identifier, data_source, operation=None,
@@ -1425,6 +1466,105 @@ class CoverageRecord(Base, BaseCoverageRecord):
         coverage_record.status = status
         coverage_record.timestamp = timestamp
         return coverage_record, is_new
+
+    @classmethod
+    def bulk_add(cls, identifiers, data_source, operation=None, timestamp=None,
+        status=BaseCoverageRecord.SUCCESS, exception=None, collection=None,
+        force=False,
+    ):
+        """Create and update CoverageRecords so that every Identifier in
+        `identifiers` has an identical record.
+        """
+        if not identifiers:
+            # Nothing to do.
+            return
+
+        _db = Session.object_session(identifiers[0])
+        timestamp = timestamp or datetime.datetime.utcnow()
+        identifier_ids = [i.id for i in identifiers]
+
+        equivalent_record = and_(
+            cls.operation==operation,
+            cls.data_source==data_source,
+            cls.collection==collection,
+        )
+
+        updated_or_created_results = list()
+        if force:
+            # Make sure that works that previously had a
+            # CoverageRecord for this operation have their timestamp
+            # and status updated.
+            update = cls.__table__.update().where(and_(
+                cls.identifier_id.in_(identifier_ids),
+                equivalent_record,
+            )).values(
+                dict(timestamp=timestamp, status=status, exception=exception)
+            ).returning(cls.id, cls.identifier_id)
+            updated_or_created_results = _db.execute(update).fetchall()
+
+        already_covered = _db.query(cls.id, cls.identifier_id).filter(
+            equivalent_record,
+            cls.identifier_id.in_(identifier_ids),
+        ).subquery()
+
+        # Make sure that any identifiers that need a CoverageRecord get one.
+        # The SELECT part of the INSERT...SELECT query.
+        data_source_id = data_source.id
+        collection_id = None
+        if collection:
+            collection_id = collection.id
+
+        new_records = _db.query(
+            Identifier.id.label('identifier_id'),
+            literal(operation, type_=String(255)).label('operation'),
+            literal(timestamp, type_=DateTime).label('timestamp'),
+            literal(status, type_=BaseCoverageRecord.status_enum).label('status'),
+            literal(exception, type_=Unicode).label('exception'),
+            literal(data_source_id, type_=Integer).label('data_source_id'),
+            literal(collection_id, type_=Integer).label('collection_id'),
+        ).select_from(Identifier).outerjoin(
+            already_covered, Identifier.id==already_covered.c.identifier_id,
+        ).filter(already_covered.c.id==None)
+
+        new_records = new_records.filter(Identifier.id.in_(identifier_ids))
+
+        # The INSERT part.
+        insert = cls.__table__.insert().from_select(
+            [
+                literal_column('identifier_id'),
+                literal_column('operation'),
+                literal_column('timestamp'),
+                literal_column('status'),
+                literal_column('exception'),
+                literal_column('data_source_id'),
+                literal_column('collection_id'),
+            ],
+            new_records
+        ).returning(cls.id, cls.identifier_id)
+
+        inserts = _db.execute(insert).fetchall()
+
+        updated_or_created_results.extend(inserts)
+        _db.commit()
+
+        # Default return for the case when all of the identifiers were
+        # ignored.
+        new_records = list()
+        ignored_identifiers = identifiers
+
+        new_and_updated_record_ids = [r[0] for r in updated_or_created_results]
+        impacted_identifier_ids = [r[1] for r in updated_or_created_results]
+
+        if new_and_updated_record_ids:
+            new_records = _db.query(cls).filter(cls.id.in_(
+                new_and_updated_record_ids
+            )).all()
+
+        ignored_identifiers = filter(
+            lambda i: i.id not in impacted_identifier_ids, identifiers
+        )
+
+        return new_records, ignored_identifiers
 
 Index("ix_coveragerecords_data_source_id_operation_identifier_id", CoverageRecord.data_source_id, CoverageRecord.operation, CoverageRecord.identifier_id)
 
@@ -1878,8 +2018,28 @@ class Identifier(Base):
         return (type, identifier_string)
 
     @classmethod
-    def parse_urns(cls, _db, identifier_strings):
-        """Batch processes URNs"""
+    def parse_urns(cls, _db, identifier_strings, autocreate=True,
+                   allowed_types=None):
+        """Converts a batch of URNs into Identifier objects.
+
+        :param _db: A database connection
+        :param identifier_strings: A list of strings, each a URN
+           identifying some identifier.
+
+        :param autocreate: Create an Identifier for a URN if none
+            presently exists.
+
+        :param allowed_types: If this is a list of Identifier
+            types, only identifiers of those types may be looked
+            up. All other identifier types will be treated as though
+            they did not exist.
+
+        :return: A 2-tuple (identifiers, failures). `identifiers` is a
+            list of Identifiers. `failures` is a list of URNs that
+            did not become Identifiers.
+        """
+        if allowed_types is not None:
+            allowed_types = set(allowed_types)
         failures = list()
         identifier_details = dict()
         for urn in identifier_strings:
@@ -1888,7 +2048,8 @@ class Identifier(Base):
                 (type, identifier) = cls.prepare_foreign_type_and_identifier(
                     *cls.type_and_identifier_for_urn(urn)
                 )
-                if type and identifier:
+                if (type and identifier and
+                    (allowed_types is None or type in allowed_types)):
                     identifier_details[urn] = (type, identifier)
                 else:
                     failures.append(urn)
@@ -1919,6 +2080,11 @@ class Identifier(Base):
             k: v for k, v in identifier_details.items()
             if v not in existing_details and k not in identifiers_by_urn.keys()
         }
+
+        if not autocreate:
+            # Don't make new identifiers. Send back unfound urns as failures.
+            failures.extend(identifier_details.keys())
+            return identifiers_by_urn, failures
 
         # Find any identifier details that don't correspond to an existing
         # identifier. Try to create them.
@@ -1983,7 +2149,7 @@ class Identifier(Base):
 
     @classmethod
     def recursively_equivalent_identifier_ids_query(
-            cls, identifier_id_column, levels=5, threshold=0.50):
+            cls, identifier_id_column, levels=5, threshold=0.50, cutoff=None):
         """Get a SQL statement that will return all Identifier IDs
         equivalent to a given ID at the given confidence threshold.
 
@@ -1993,11 +2159,11 @@ class Identifier(Base):
 
         This uses the function defined in files/recursive_equivalents.sql.
         """
-        return select([func.fn_recursive_equivalents(identifier_id_column, levels, threshold)])
+        return select([func.fn_recursive_equivalents(identifier_id_column, levels, threshold, cutoff)])
 
     @classmethod
     def recursively_equivalent_identifier_ids(
-            cls, _db, identifier_ids, levels=5, threshold=0.50):
+            cls, _db, identifier_ids, levels=3, threshold=0.50, cutoff=None):
         """All Identifier IDs equivalent to the given set of Identifier
         IDs at the given confidence threshold.
 
@@ -2008,9 +2174,12 @@ class Identifier(Base):
 
         Returns a dictionary mapping each ID in the original to a
         list of equivalent IDs.
-        """
 
-        query = select([Identifier.id, func.fn_recursive_equivalents(Identifier.id, levels, threshold)],
+        :param cutoff: For each recursion level, results will be cut
+        off at this many results. (The maximum total number of results
+        is levels * cutoff)
+        """
+        query = select([Identifier.id, func.fn_recursive_equivalents(Identifier.id, levels, threshold, cutoff)],
                        Identifier.id.in_(identifier_ids))
         results = _db.execute(query)
         equivalents = defaultdict(list)
@@ -2036,7 +2205,8 @@ class Identifier(Base):
                 return lp
 
     def add_link(self, rel, href, data_source, media_type=None, content=None,
-                 content_path=None):
+                 content_path=None, rights_status_uri=None, rights_explanation=None,
+                 original_resource=None, transformation_settings=None):
         """Create a link between this Identifier and a (potentially new)
         Resource.
 
@@ -2049,9 +2219,14 @@ class Identifier(Base):
         # Find or create the Resource.
         if not href:
             href = Hyperlink.generic_uri(data_source, self, rel, content)
+        rights_status = None
+        if rights_status_uri:
+            rights_status = RightsStatus.lookup(_db, rights_status_uri)
         resource, new_resource = get_one_or_create(
             _db, Resource, url=href,
-            create_method_kwargs=dict(data_source=data_source)
+            create_method_kwargs=dict(data_source=data_source, 
+                                      rights_status=rights_status,
+                                      rights_explanation=rights_explanation)
         )
 
         # Find or create the Hyperlink.
@@ -2063,18 +2238,18 @@ class Identifier(Base):
         if content or content_path:
             # We have content for this resource.
             resource.set_fetched_content(media_type, content, content_path)
-        elif (media_type and (
-                not resource.representation
-                or not resource.representation.mirrored_at)
-        ):
-            # There's a version of this resource stored elsewhere that we
-            # can use.
-            #
-            # TODO: just because we know the type and URL of the
-            # resource doesn't mean we can actually serve that URL
-            # to patrons. This needs some work.
-            resource.set_mirrored_elsewhere(media_type)
+        elif (media_type and not resource.representation):
+            # We know the type of the resource, so make a
+            # Representation for it.
+            resource.representation, is_new = get_one_or_create(
+                _db, Representation, url=resource.url, media_type=media_type
+            )
 
+        if original_resource:
+            original_resource.add_derivative(link.resource, transformation_settings)
+
+        # TODO: This is where we would mirror the resource if we
+        # wanted to.
         return link, new_link
 
     def add_measurement(self, data_source, quantity_measured, value,
@@ -2196,8 +2371,6 @@ class Identifier(Base):
         images = cls.resources_for_identifier_ids(
             _db, identifier_ids, rel)
         images = images.join(Resource.representation)
-        images = images.filter(Representation.mirrored_at != None).\
-            filter(Representation.mirror_url != None)
         images = images.all()
 
         champions = Resource.best_covers_among(images)
@@ -2283,8 +2456,13 @@ class Identifier(Base):
             collection_id = collection.id
         else:
             collection_id = None
+
+        data_source_id = None
+        if coverage_data_source:
+            data_source_id = coverage_data_source.id
+
         clause = and_(Identifier.id==CoverageRecord.identifier_id,
-                      CoverageRecord.data_source==coverage_data_source,
+                      CoverageRecord.data_source_id==data_source_id,
                       CoverageRecord.operation==operation,
                       CoverageRecord.collection_id==collection_id
         )
@@ -2301,7 +2479,6 @@ class Identifier(Base):
 
         return qu
 
-
     def opds_entry(self):
         """Create an OPDS entry using only resources directly
         associated with this Identifier.
@@ -2311,10 +2488,17 @@ class Identifier(Base):
 
         Currently the only things in this OPDS entry will be description,
         cover image, and popularity.
+
+        NOTE: The timestamp doesn't take into consideration when the
+        description was added. Rather than fixing this it's probably
+        better to get rid of this hack and create real Works where we
+        would be using this method.
         """
         id = self.urn
         cover_image = None
         description = None
+        most_recent_update = None
+        timestamps = []
         for link in self.links:
             resource = link.resource
             if link.rel == Hyperlink.IMAGE:
@@ -2322,20 +2506,29 @@ class Identifier(Base):
                         not cover_image.representation.thumbnails and
                         resource.representation.thumbnails):
                     cover_image = resource
+                    if cover_image.representation:
+                        # This is technically redundant because
+                        # minimal_opds_entry will redo this work,
+                        # but just to be safe.
+                        mirrored_at = cover_image.representation.mirrored_at
+                        if mirrored_at:
+                            timestamps.append(mirrored_at)
             elif link.rel == Hyperlink.DESCRIPTION:
                 if not description or resource.quality > description.quality:
                     description = resource
 
-        last_coverage_update = None
         if self.coverage_records:
-            timestamps = [c.timestamp for c in self.coverage_records]
-            last_coverage_update = max(timestamps)
+            timestamps.extend([
+                c.timestamp for c in self.coverage_records if c.timestamp
+            ])
+        if timestamps:
+            most_recent_update = max(timestamps)
 
         quality = Measurement.overall_quality(self.measurements)
         from opds import AcquisitionFeed
         return AcquisitionFeed.minimal_opds_entry(
             identifier=self, cover=cover_image, description=description,
-            quality=quality, most_recent_update=last_coverage_update
+            quality=quality, most_recent_update=most_recent_update
         )
 
 
@@ -2379,7 +2572,6 @@ class Contributor(Base):
     # Types of roles
     AUTHOR_ROLE = u"Author"
     PRIMARY_AUTHOR_ROLE = u"Primary Author"
-    PERFORMER_ROLE = u"Performer"
     EDITOR_ROLE = u"Editor"
     ARTIST_ROLE = u"Artist"
     PHOTOGRAPHER_ROLE = u"Photographer"
@@ -2410,12 +2602,49 @@ class Contributor(Base):
     DESIGNER_ROLE = u'Designer'
     AUTHOR_ROLES = set([PRIMARY_AUTHOR_ROLE, AUTHOR_ROLE])
 
+    # Map our recognized roles to MARC relators.
+    # https://www.loc.gov/marc/relators/relaterm.html
+    #
+    # This is used when crediting contributors in OPDS feeds.
+    MARC_ROLE_CODES = {
+        ACTOR_ROLE : 'act',
+        ADAPTER_ROLE : 'adp',
+        AFTERWORD_ROLE : 'aft',
+        ARTIST_ROLE : 'art',
+        ASSOCIATED_ROLE : 'asn',
+        AUTHOR_ROLE : 'aut',            # Joint author: USE Author
+        COLLABORATOR_ROLE : 'ctb',      # USE Contributor
+        COLOPHON_ROLE : 'aft',          # Author of afterword, colophon, etc.
+        COMPILER_ROLE : 'com',
+        COMPOSER_ROLE : 'cmp',
+        CONTRIBUTOR_ROLE : 'ctb',
+        COPYRIGHT_HOLDER_ROLE : 'cph',
+        DESIGNER_ROLE : 'dsr',
+        DIRECTOR_ROLE : 'drt',
+        EDITOR_ROLE : 'edt',
+        ENGINEER_ROLE : 'eng',
+        EXECUTIVE_PRODUCER_ROLE : 'pro',
+        FOREWORD_ROLE : 'wpr',          # Writer of preface
+        ILLUSTRATOR_ROLE : 'ill',
+        INTRODUCTION_ROLE : 'win',
+        LYRICIST_ROLE : 'lyr',
+        MUSICIAN_ROLE : 'mus',
+        NARRATOR_ROLE : 'nrt',
+        PERFORMER_ROLE : 'prf',
+        PHOTOGRAPHER_ROLE : 'pht',
+        PRIMARY_AUTHOR_ROLE : 'aut',
+        PRODUCER_ROLE : 'pro',
+        TRANSCRIBER_ROLE : 'trc',
+        TRANSLATOR_ROLE : 'trl',
+        UNKNOWN_ROLE : 'asn',
+    }
+
     # People from these roles can be put into the 'author' slot if no
     # author proper is given.
     AUTHOR_SUBSTITUTE_ROLES = [
         EDITOR_ROLE, COMPILER_ROLE, COMPOSER_ROLE, DIRECTOR_ROLE,
-         CONTRIBUTOR_ROLE, TRANSLATOR_ROLE, ADAPTER_ROLE, PHOTOGRAPHER_ROLE,
-         ARTIST_ROLE, LYRICIST_ROLE, COPYRIGHT_HOLDER_ROLE
+        CONTRIBUTOR_ROLE, TRANSLATOR_ROLE, ADAPTER_ROLE, PHOTOGRAPHER_ROLE,
+        ARTIST_ROLE, LYRICIST_ROLE, COPYRIGHT_HOLDER_ROLE
     ]
 
     PERFORMER_ROLES = [ACTOR_ROLE, PERFORMER_ROLE, NARRATOR_ROLE, MUSICIAN_ROLE]
@@ -2658,6 +2887,7 @@ class Contributor(Base):
 
     @classmethod
     def _default_names(cls, name, default_display_name=None):
+        name = name or ""
         original_name = name
         """Split out from default_names to make it easy to test."""
         display_name = default_display_name
@@ -2822,6 +3052,7 @@ class Edition(Base):
     # A Project Gutenberg text was likely `published` long before being `issued`.
     published = Column(Date)
 
+    ALL_MEDIUM = object()
     BOOK_MEDIUM = u"Book"
     PERIODICAL_MEDIUM = u"Periodical"
     AUDIO_MEDIUM = u"Audio"
@@ -2833,9 +3064,13 @@ class Edition(Base):
     ELECTRONIC_FORMAT = u"Electronic"
     CODEX_FORMAT = u"Codex"
 
+    # These are the media types currently fulfillable by the default
+    # client.
+    FULFILLABLE_MEDIA = [BOOK_MEDIUM, AUDIO_MEDIUM]
+
     medium_to_additional_type = {
-        BOOK_MEDIUM : u"http://schema.org/Book",
-        AUDIO_MEDIUM : u"http://schema.org/AudioObject",
+        BOOK_MEDIUM : u"http://schema.org/EBook",
+        AUDIO_MEDIUM : u"http://bib.schema.org/Audiobook",
         PERIODICAL_MEDIUM : u"http://schema.org/PublicationIssue",
         MUSIC_MEDIUM :  u"http://schema.org/MusicRecording",
         VIDEO_MEDIUM :  u"http://schema.org/VideoObject",
@@ -3133,7 +3368,7 @@ class Edition(Base):
         old_cover = self.cover
         old_cover_full_url = self.cover_full_url
         self.cover = resource
-        self.cover_full_url = resource.representation.mirror_url
+        self.cover_full_url = resource.representation.public_url
 
         # TODO: In theory there could be multiple scaled-down
         # versions of this representation and we need some way of
@@ -3142,18 +3377,18 @@ class Edition(Base):
         if (resource.representation.image_height
             and resource.representation.image_height <= self.MAX_THUMBNAIL_HEIGHT):
             # This image doesn't need a thumbnail.
-            self.cover_thumbnail_url = resource.representation.mirror_url
+            self.cover_thumbnail_url = resource.representation.public_url
         else:
-            for scaled_down in resource.representation.thumbnails:
-                if scaled_down.mirror_url and scaled_down.mirrored_at:
-                    self.cover_thumbnail_url = scaled_down.mirror_url
-                    break
+            # Use the best available thumbnail for this image.
+            best_thumbnail = resource.representation.best_thumbnail
+            if best_thumbnail:
+                self.cover_thumbnail_url = best_thumbnail.public_url
         if (not self.cover_thumbnail_url and
             resource.representation.image_height
             and resource.representation.image_height <= self.MAX_FALLBACK_THUMBNAIL_HEIGHT):
             # The full-sized image is too large to be a thumbnail, but it's
             # not huge, and there is no other thumbnail, so use it.
-            self.cover_thumbnail_url = resource.representation.mirror_url
+            self.cover_thumbnail_url = resource.representation.public_url
         if old_cover != self.cover or old_cover_full_url != self.cover_full_url:
             logging.debug(
                 "Setting cover for %s/%s: full=%s thumb=%s",
@@ -3403,7 +3638,7 @@ class Edition(Base):
                     self.permanent_work_id, self.language
             ]
             if self.cover and self.cover.representation:
-                args.append(self.cover.representation.mirror_url)
+                args.append(self.cover.representation.public_url)
             else:
                 args.append(None)
             level(msg, *args)
@@ -3451,11 +3686,11 @@ class Edition(Base):
                     )
                 else:
                     rep = best_cover.representation
-                    if not rep.mirrored_at and not rep.thumbnails:
+                    if not rep.thumbnails:
                         logging.warn(
-                            "Best cover for %r (%s) was never mirrored or thumbnailed!",
+                            "Best cover for %r (%s) was never thumbnailed!",
                             self.primary_identifier,
-                            rep.url
+                            rep.public_url
                         )
                 self.set_cover(best_cover)
                 break
@@ -3487,14 +3722,8 @@ class Edition(Base):
                         )
                     else:
                         rep = best_thumbnail.representation
-                        if not rep.mirrored_at:
-                            logging.warn(
-                                "Best thumbnail for %r (%s) was never mirrored!",
-                                self.primary_identifier, rep.url
-                            )
-                            self.cover_thumbnail_url = rep.url
-                        else:
-                            self.cover_thumbnail_url = rep.mirror_url
+                        if rep:
+                            self.cover_thumbnail_url = rep.public_url
                         break
             else:
                 # No thumbnail was found. If the Edition references a thumbnail,
@@ -3854,13 +4083,63 @@ class Work(Base):
             LicensePool.identifier).join(
                 Identifier.classifications).join(
                     Classification.subject)
-        return qu.filter(Subject.checked==False).distinct()
+        return qu.filter(Subject.checked==False).order_by(Subject.id)
 
     @classmethod
-    def open_access_for_permanent_work_id(cls, _db, pwid, medium):
+    def _potential_open_access_works_for_permanent_work_id(
+            cls, _db, pwid, medium, language
+    ):
+        """Find all Works that might be suitable for use as the
+        canonical open-access Work for the given `pwid`, `medium`,
+        and `language`.
+
+        :return: A 2-tuple (pools, counts_by_work). `pools` is a set
+        containing all affected LicensePools; `counts_by_work is a
+        Counter tallying the number of affected LicensePools
+        associated with a given work.
+        """
+        qu = _db.query(LicensePool).join(
+            LicensePool.presentation_edition).filter(
+                LicensePool.open_access==True
+            ).filter(
+                Edition.permanent_work_id==pwid
+            ).filter(
+                Edition.medium==medium
+            ).filter(
+                Edition.language==language
+            )
+        pools = set(qu.all())
+
+        # Build the Counter of Works that are eligible to represent
+        # this pwid/medium/language combination.
+        affected_licensepools_for_work = Counter()
+        for lp in pools:
+            work = lp.work
+            if not lp.work:
+                continue
+            if affected_licensepools_for_work[lp.work]:
+                # We already got this information earlier in the loop.
+                continue
+            pe = work.presentation_edition
+            if pe and (
+                    pe.language != language or pe.medium != medium
+                    or pe.permanent_work_id != pwid
+            ):
+                # This Work's presentation edition doesn't match
+                # this LicensePool's presentation edition.
+                # It would be better to create a brand new Work and
+                # remove this LicensePool from its current Work.
+                continue
+            affected_licensepools_for_work[lp.work] = len(
+                [x for x in pools if x.work == lp.work]
+            )
+        return pools, affected_licensepools_for_work
+
+    @classmethod
+    def open_access_for_permanent_work_id(cls, _db, pwid, medium, language):
         """Find or create the Work encompassing all open-access LicensePools
-        whose presentation Editions have the given permanent work ID and
-        the given medium.
+        whose presentation Editions have the given permanent work ID,
+        the given medium, and the given language.
 
         This may result in the consolidation or splitting of Works, if
         a book's permanent work ID has changed without
@@ -3869,28 +4148,13 @@ class Work(Base):
         """
         is_new = False
 
-        # Find all open-access LicensePools whose presentation
-        # Editions have the given permanent work ID and medium.
-        qu = _db.query(LicensePool).join(
-            LicensePool.presentation_edition).filter(
-                Edition.permanent_work_id==pwid
-            ).filter(
-                LicensePool.open_access==True
-            ).filter(
-                Edition.medium==medium
-            )
-
-        licensepools = qu.all()
+        licensepools, licensepools_for_work = cls._potential_open_access_works_for_permanent_work_id(
+            _db, pwid, medium, language
+        )
         if not licensepools:
-            # There are no LicensePools for this PWID. Do nothing.
+            # There is no work for this PWID/medium/language combination
+            # because no LicensePools offer it.
             return None, is_new
-
-        # Tally up how many LicensePools are associated with each
-        # Work.
-        licensepools_for_work = Counter()
-        for lp in qu:
-            if lp.work and not licensepools_for_work[lp.work]:
-                licensepools_for_work[lp.work] = len(lp.work.license_pools)
 
         work = None
         if len(licensepools_for_work) == 0:
@@ -3914,7 +4178,7 @@ class Work(Base):
                 # open-access work for its permanent work ID.
                 # Otherwise the merge may fail.
                 work.make_exclusive_open_access_for_permanent_work_id(
-                    pwid, medium
+                    pwid, medium, language
                 )
                 for needs_merge in licensepools_for_work.keys():
                     if needs_merge != work:
@@ -3923,17 +4187,18 @@ class Work(Base):
                         # nothing but LicensePools whose permanent
                         # work ID matches the permanent work ID of the
                         # Work we're about to merge into.
-                        needs_merge.make_exclusive_open_access_for_permanent_work_id(pwid, medium)
+                        needs_merge.make_exclusive_open_access_for_permanent_work_id(pwid, medium, language)
                         needs_merge.merge_into(work)
 
         # At this point we have one, and only one, Work for this
         # permanent work ID. Assign it to every LicensePool whose
-        # presentation Edition has that permanent work ID.
+        # presentation Edition has that permanent work ID/medium/language
+        # combination.
         for lp in licensepools:
             lp.work = work
         return work, is_new
 
-    def make_exclusive_open_access_for_permanent_work_id(self, pwid, medium):
+    def make_exclusive_open_access_for_permanent_work_id(self, pwid, medium, language):
         """Ensure that every open-access LicensePool associated with this Work
         has the given PWID and medium. Any non-open-access
         LicensePool, and any LicensePool with a different PWID or a
@@ -3977,14 +4242,14 @@ class Work(Base):
                     e.work = None
                     pool.work = None
                     continue
-                if this_pwid != pwid or e.medium != medium:
+                if this_pwid != pwid or e.medium != medium or e.language != language:
                     # This LicensePool should not belong to this Work.
                     # Make sure it gets its own Work, creating a new one
                     # if necessary.
                     pool.work = None
                     pool.presentation_edition.work = None
                     other_work, is_new = Work.open_access_for_permanent_work_id(
-                        _db, this_pwid, pool.presentation_edition.medium
+                        _db, this_pwid, e.medium, e.language
                     )
             if other_work and is_new:
                 other_work.calculate_presentation()
@@ -4069,7 +4334,7 @@ class Work(Base):
         return q
 
     @classmethod
-    def from_identifiers(cls, _db, identifiers, base_query=None):
+    def from_identifiers(cls, _db, identifiers, base_query=None, identifier_id_field=Identifier.id):
         """Returns all of the works that have one or more license_pools
         associated with either an identifier in the given list or an
         identifier considered equivalent to one of those listed
@@ -4088,7 +4353,7 @@ class Work(Base):
             Identifier.id, levels=1, threshold=0.999)
         identifier_ids_subquery = identifier_ids_subquery.where(Identifier.id.in_(identifier_ids))
 
-        query = base_query.filter(Identifier.id.in_(identifier_ids_subquery))
+        query = base_query.filter(identifier_id_field.in_(identifier_ids_subquery))
         return query
 
     @classmethod
@@ -4179,7 +4444,7 @@ class Work(Base):
         )
         return q
 
-    def all_identifier_ids(self, recursion_level=5):
+    def all_identifier_ids(self, recursion_level=3, cutoff=None):
         _db = Session.object_session(self)
         primary_identifier_ids = [
             lp.identifier.id for lp in self.license_pools
@@ -4187,7 +4452,7 @@ class Work(Base):
         ]
         # Get a dict that maps identifier ids to lists of their equivalents.
         equivalent_lists = Identifier.recursively_equivalent_identifier_ids(
-            _db, primary_identifier_ids, recursion_level)
+            _db, primary_identifier_ids, recursion_level, cutoff=cutoff)
 
         identifier_ids = set()
         for equivs in equivalent_lists.values():
@@ -4309,7 +4574,7 @@ class Work(Base):
 
     def calculate_presentation(
         self, policy=None, search_index_client=None, exclude_search=False,
-        default_fiction=False, default_audience=Classifier.AUDIENCE_ADULT
+        default_fiction=None, default_audience=None
     ):
         """Make a Work ready to show to patrons.
 
@@ -4517,14 +4782,13 @@ class Work(Base):
             VerboseAnnotator,
         )
         _db = Session.object_session(self)
-        simple = AcquisitionFeed.single_entry(_db, self, Annotator,
-                                              force_create=True)
-        if simple is not None:
-            self.simple_opds_entry = unicode(etree.tostring(simple))
-        verbose = AcquisitionFeed.single_entry(_db, self, VerboseAnnotator,
-                                               force_create=True)
-        if verbose is not None:
-            self.verbose_opds_entry = unicode(etree.tostring(verbose))
+        simple = AcquisitionFeed.single_entry(
+            _db, self, Annotator, force_create=True
+        )
+        if verbose is True:
+            verbose = AcquisitionFeed.single_entry(
+                _db, self, VerboseAnnotator, force_create=True
+            )
         WorkCoverageRecord.add_for(
             self, operation=WorkCoverageRecord.GENERATE_OPDS_OPERATION
         )
@@ -4761,25 +5025,46 @@ class Work(Base):
             )
         ).alias('works_alias')
 
+        work_id_column = literal_column(
+            works_alias.name + '.' + works_alias.c.work_id.name
+        )
+
+        def query_to_json(query):
+            """Convert the results of a query to a JSON object."""
+            return select(
+                [func.row_to_json(literal_column(query.name))]
+            ).select_from(query)
+
+        def query_to_json_array(query):
+            """Convert the results of a query into a JSON array."""
+            return select(
+                [func.array_to_json(
+                    func.array_agg(
+                        func.row_to_json(
+                            literal_column(query.name)
+                        )))]
+            ).select_from(query)
+
         # This subquery gets Collection IDs for collections
         # that own more than zero licenses for this book.
         collections = select(
             [LicensePool.collection_id]
         ).where(
             and_(
-                LicensePool.work_id==literal_column(works_alias.name + '.' + works_alias.c.work_id.name),
+                LicensePool.work_id==work_id_column,
                 or_(LicensePool.open_access, LicensePool.licenses_owned>0)
             )
         ).alias("collections_subquery")
+        collections_json = query_to_json_array(collections)
 
-        # Create a json array from the set of Collections.
-        collections_json = select(
-            [func.array_to_json(
-                    func.array_agg(
-                        func.row_to_json(
-                            literal_column(collections.name)
-                        )))]
-        ).select_from(collections)
+        # This subquery gets CustomList IDs for all lists
+        # that contain the work.
+        customlists = select(
+            [CustomListEntry.list_id]
+        ).where(
+            CustomListEntry.work_id==work_id_column
+        ).alias("listentries_subquery")
+        customlists_json = query_to_json_array(customlists)
 
         # This subquery gets Contributors, filtered on edition_id.
         contributors = select(
@@ -4795,16 +5080,7 @@ class Work(Base):
                 Contributor.id==Contribution.contributor_id
             )
         ).alias("contributors_subquery")
-
-        # Create a json array from the set of Contributors.
-        contributors_json = select(
-            [func.array_to_json(
-                    func.array_agg(
-                        func.row_to_json(
-                            literal_column(contributors.name)
-                        )))]
-        ).select_from(contributors)
-
+        contributors_json = query_to_json_array(contributors)
 
         # For Classifications, use a subquery to get recursively equivalent Identifiers
         # for the Edition's primary_identifier_id.
@@ -4841,15 +5117,7 @@ class Work(Base):
         ).select_from(
             join(Classification, Subject, Classification.subject_id==Subject.id)
         ).alias("subjects_subquery")
-
-        # Create a json array for the set of Subjects.
-        subjects_json = select(
-            [func.array_to_json(
-                    func.array_agg(
-                        func.row_to_json(
-                            literal_column(subjects.name)
-                        )))]
-        ).select_from(subjects)
+        subjects_json = query_to_json_array(subjects)
 
 
         # Subquery for genres.
@@ -4865,15 +5133,7 @@ class Work(Base):
         ).select_from(
             join(WorkGenre, Genre, WorkGenre.genre_id==Genre.id)
         ).alias("genres_subquery")
-
-        # Create a json array for the set of Genres.
-        genres_json = select(
-            [func.array_to_json(
-                    func.array_agg(
-                        func.row_to_json(
-                            literal_column(genres.name)
-                        )))]
-        ).select_from(genres)
+        genres_json = query_to_json_array(genres)
 
 
         # When we set an inclusive target age range, the upper bound is converted to
@@ -4889,11 +5149,7 @@ class Work(Base):
         ).where(
             Work.id==literal_column(works_alias.name + "." + works_alias.c.work_id.name)
         ).alias('target_age_subquery')
-        # Create the target age json object.
-        target_age_json = select(
-            [func.row_to_json(literal_column(target_age.name))]
-        ).select_from(target_age)
-
+        target_age_json = query_to_json(target_age)
 
         # Now, create a query that brings together everything we need for the final
         # search document.
@@ -4927,6 +5183,7 @@ class Work(Base):
 
              # Here are all the subqueries.
              collections_json.label("collections"),
+             customlists_json.label("customlists"),
              contributors_json.label("contributors"),
              subjects_json.label("classifications"),
              genres_json.label('genres'),
@@ -4937,11 +5194,7 @@ class Work(Base):
         ).alias("search_data_subquery")
 
         # Finally, convert everything to json.
-        search_json = select(
-            [func.row_to_json(
-                    literal_column(search_data.name)
-                )]
-        ).select_from(search_data)
+        search_json = query_to_json(search_data)
 
         result = _db.execute(search_json)
         if result:
@@ -5078,7 +5331,8 @@ class Measurement(Base):
         DataSource.OVERDRIVE : [1, 5],
         DataSource.AMAZON : [1, 5],
         DataSource.UNGLUE_IT: [1, 5],
-        DataSource.NOVELIST: [0, 5]
+        DataSource.NOVELIST: [0, 5],
+        DataSource.LIBRARY_STAFF: [1, 5],
     }
 
     id = Column(Integer, primary_key=True)
@@ -5260,7 +5514,7 @@ class LicensePoolDeliveryMechanism(Base):
 
     @classmethod
     def set(cls, data_source, identifier, content_type, drm_scheme, rights_uri,
-            resource=None):
+            resource=None, autocommit=True):
         """Register the fact that a distributor makes a title available in a
         certain format.
 
@@ -5273,25 +5527,45 @@ class LicensePoolDeliveryMechanism(Base):
             title.
         :param resource: A Resource representing the book itself in
             a freely redistributable form.
+        :param autocommit: Commit the database session immediately if
+            anything changes in the database. If you're already inside
+            a nested transaction, pass in False here to avoid
+            committing prematurely, but understand that if a
+            LicensePool's open-access status changes as a result of
+            calling this method, the change may not be properly
+            reflected in LicensePool.open_access.
         """
         _db = Session.object_session(data_source)
         delivery_mechanism, ignore = DeliveryMechanism.lookup(
             _db, content_type, drm_scheme
         )
         rights_status = RightsStatus.lookup(_db, rights_uri)
-        lpdm, ignore = get_one_or_create(
+        lpdm, dirty = get_one_or_create(
             _db, LicensePoolDeliveryMechanism,
             identifier=identifier,
             data_source=data_source,
             delivery_mechanism=delivery_mechanism,
             resource=resource
         )
-        lpdm.rights_status = rights_status
+        if not lpdm.rights_status or rights_status.uri != RightsStatus.UNKNOWN:
+            # We have better information available about the
+            # rights status of this delivery mechanism.
+            lpdm.rights_status = rights_status
+            dirty = True
 
-        # Creating or modifying a LPDM might change the open-access status
-        # of all LicensePools for that DataSource/Identifier.
-        for pool in lpdm.license_pools:
-            pool.set_open_access_status()
+        if dirty:
+            # TODO: We need to explicitly commit here so that
+            # LicensePool.delivery_mechanisms gets updated. It would be
+            # better if we didn't have to do this, but I haven't been able
+            # to get LicensePool.delivery_mechanisms to notice that it's
+            # out of date.
+            if autocommit:
+                _db.commit()
+
+            # Creating or modifying a LPDM might change the open-access status
+            # of all LicensePools for that DataSource/Identifier.
+            for pool in lpdm.license_pools:
+                pool.set_open_access_status()
         return lpdm
 
     @property
@@ -5300,11 +5574,60 @@ class LicensePoolDeliveryMechanism(Base):
         return (self.rights_status
                 and self.rights_status.uri in RightsStatus.OPEN_ACCESS)
 
+    def compatible_with(self, other):
+        """Can a single loan be fulfilled with both this
+        LicensePoolDeliveryMechanism and the given one?
+
+        :param other: A LicensePoolDeliveryMechanism.
+        """
+        if not isinstance(other, LicensePoolDeliveryMechanism):
+            return False
+
+        if other.id==self.id:
+            # They two LicensePoolDeliveryMechanisms are the same object.
+            return True
+
+        # The two LicensePoolDeliveryMechanisms must be different ways
+        # of getting the same book from the same source.
+        if other.identifier_id != self.identifier_id:
+            return False
+        if other.data_source_id != self.data_source_id:
+            return False
+
+        if other.delivery_mechanism_id == self.delivery_mechanism_id:
+            # We have two LicensePoolDeliveryMechanisms for the same
+            # underlying delivery mechanism. This can happen when an
+            # open-access book gets its content mirrored to two
+            # different places.
+            return True
+
+        # If the DeliveryMechanisms themselves are compatible, then the
+        # LicensePoolDeliveryMechanisms are compatible.
+        #
+        # In practice, this means that either the two
+        # DeliveryMechanisms are the same or that one of them is a
+        # streaming mechanism.
+        open_access_rules = self.is_open_access and other.is_open_access
+        return (
+            other.delivery_mechanism
+            and self.delivery_mechanism.compatible_with(
+                other.delivery_mechanism, open_access_rules
+            )
+        )
+
     def delete(self):
         """Delete a LicensePoolDeliveryMechanism."""
         _db = Session.object_session(self)
         pools = list(self.license_pools)
         _db.delete(self)
+
+        # TODO: We need to explicitly commit here so that
+        # LicensePool.delivery_mechanisms gets updated. It would be
+        # better if we didn't have to do this, but I haven't been able
+        # to get LicensePool.delivery_mechanisms to notice that it's
+        # out of date.
+        _db.commit()
+
         # The deletion of a LicensePoolDeliveryMechanism might affect
         # the open-access status of its associated LicensePools.
         for pool in pools:
@@ -5368,8 +5691,9 @@ class Hyperlink(Base):
 
     # TODO: Is this the appropriate relation?
     DRM_ENCRYPTED_DOWNLOAD = u"http://opds-spec.org/acquisition/"
+    BORROW = u"http://opds-spec.org/acquisition/borrow"
 
-    CIRCULATION_ALLOWED = [OPEN_ACCESS_DOWNLOAD, DRM_ENCRYPTED_DOWNLOAD, GENERIC_OPDS_ACQUISITION]
+    CIRCULATION_ALLOWED = [OPEN_ACCESS_DOWNLOAD, DRM_ENCRYPTED_DOWNLOAD, BORROW, GENERIC_OPDS_ACQUISITION]
     METADATA_ALLOWED = [CANONICAL, IMAGE, THUMBNAIL_IMAGE, ILLUSTRATION, REVIEW,
         DESCRIPTION, SHORT_DESCRIPTION, AUTHOR, ALTERNATE, SAMPLE]
     MIRRORED = [OPEN_ACCESS_DOWNLOAD, IMAGE, THUMBNAIL_IMAGE]
@@ -5390,6 +5714,40 @@ class Hyperlink(Base):
     # The Resource on the other end of the link.
     resource_id = Column(
         Integer, ForeignKey('resources.id'), index=True, nullable=False)
+
+    @classmethod
+    def unmirrored(cls, collection):
+        """Find all Hyperlinks associated with an item in the
+        given Collection that could be mirrored but aren't.
+
+        TODO: We don't cover the case where an image was mirrored but no
+        thumbnail was created of it. (We do cover the case where the thumbnail
+        was created but not mirrored.)
+        """
+        _db = Session.object_session(collection)
+        qu = _db.query(Hyperlink).join(
+            Hyperlink.identifier
+        ).join(
+            Identifier.licensed_through
+        ).outerjoin(
+            Hyperlink.resource
+        ).outerjoin(
+            Resource.representation
+        )
+        qu = qu.filter(LicensePool.collection_id==collection.id)
+        qu = qu.filter(Hyperlink.rel.in_(Hyperlink.MIRRORED))
+        qu = qu.filter(Hyperlink.data_source==collection.data_source)
+        qu = qu.filter(
+            or_(
+                Representation.id==None,
+                Representation.mirror_url==None,
+            )
+        )
+        # Without this ordering, the query does a table scan looking for
+        # items that match. With the ordering, they're all at the front.
+        qu = qu.order_by(Representation.mirror_url.asc().nullsfirst(),
+                         Representation.id.asc().nullsfirst())
+        return qu
 
     @classmethod
     def generic_uri(cls, data_source, identifier, rel, content=None):
@@ -5474,6 +5832,32 @@ class Resource(Base):
     representation_id = Column(
         Integer, ForeignKey('representations.id'), index=True)
 
+    # The rights status of this Resource.
+    rights_status_id = Column(Integer, ForeignKey('rightsstatus.id'))
+
+    # An optional explanation of the rights status.
+    rights_explanation = Column(Unicode)
+
+    # A Resource may be transformed into many derivatives.
+    transformations = relationship(
+        'ResourceTransformation',
+        primaryjoin="ResourceTransformation.original_id==Resource.id",
+        foreign_keys=id,
+        lazy="joined",
+        backref=backref('original', uselist=False),
+        uselist=True,
+    )
+
+    # A derivative resource may have one original.
+    derived_through = relationship(
+        'ResourceTransformation',
+        primaryjoin="ResourceTransformation.derivative_id==Resource.id",
+        foreign_keys=id,
+        backref=backref('derivative', uselist=False),
+        lazy="joined",
+        uselist=False,
+    )
+
     # A calculated value for the quality of this resource, based on an
     # algorithmic treatment of its content.
     estimated_quality = Column(Float)
@@ -5510,16 +5894,13 @@ class Resource(Base):
             return None
         return self.representation.mirror_url
 
-    def set_mirrored_elsewhere(self, media_type):
-        """We don't need our own copy of this resource's representation--
-        a copy of it has been mirrored already.
+    def as_delivery_mechanism_for(self, licensepool):
+        """If this Resource is used in a LicensePoolDeliveryMechanism for the
+        given LicensePool, return that LicensePoolDeliveryMechanism.
         """
-        _db = Session.object_session(self)
-        if not self.representation:
-            self.representation, is_new = get_one_or_create(
-                _db, Representation, url=self.url, media_type=media_type)
-        self.representation.mirror_url = self.url
-        self.representation.set_as_mirrored()
+        for lpdm in licensepool.delivery_mechanisms:
+            if lpdm.resource == self:
+                return lpdm
 
     def set_fetched_content(self, media_type, content, content_path):
         """Simulate a successful HTTP request for a representation
@@ -5644,8 +6025,7 @@ class Resource(Base):
 
         """Choose the best covers from a list of Resources."""
         champions = []
-        champion_score = None
-        champion_media_type_score = None
+        champion_key = None
 
         for r in resources:
             rep = r.representation
@@ -5653,6 +6033,8 @@ class Resource(Base):
                 # A Resource with no Representation is not usable, period
                 continue
             media_priority = cls.image_type_priority(rep.media_type)
+            if media_priority is None:
+                media_priority = float('inf')
 
             # This method will set the quality if it hasn't been set before.
             r.quality_as_thumbnail_image
@@ -5662,22 +6044,22 @@ class Resource(Base):
                 # A Resource below the minimum quality threshold is not
                 # usable, period.
                 continue
-            if not champions or quality > champion_score:
+
+            # In order, our criteria are: whether we
+            # mirrored the representation (which means we directly
+            # control it), image quality, and media type suitability.
+            #
+            # We invert media type suitability because it's given to us
+            # as a priority (where smaller is better), but we want to compare
+            # it as a quantity (where larger is better).
+            compare_key = (rep.mirror_url is not None, quality, -media_priority)
+            if not champion_key or (compare_key > champion_key):
+                # A new champion.
                 champions = [r]
-                champion_score = r.quality
-                champion_media_type_priority = media_priority
-            elif quality == champion_score:
-                # We have two images with the same score. One might be
-                # in a format we prefer.
-                if (champion_media_type_priority is None
-                    or (media_priority is not None
-                        and media_priority < champion_media_type_priority)):
-                    champions = [r]
-                    champion_score = r.quality
-                    champion_media_type_priority = media_priority
-                elif media_priority == champion_media_type_priority:
-                    # Same score, same format. We have two champions.
-                    champions.append(r)
+                champion_key = compare_key
+            elif compare_key == champion_key:
+                # This image is equally good as the existing champion.
+                champions.append(r)
 
         return champions
 
@@ -5713,6 +6095,32 @@ class Resource(Base):
         self.set_estimated_quality(quality)
         return quality
 
+    def add_derivative(self, derivative_resource, settings=None):
+        _db = Session.object_session(self)
+
+        transformation, ignore = get_one_or_create(
+            _db, ResourceTransformation, derivative_id=derivative_resource.id)
+        transformation.original_id = self.id
+        transformation.settings = settings or {}
+        return transformation
+
+class ResourceTransformation(Base):
+    """A record that a resource is a derivative of another resource,
+    and the settings that were used to transform the original into it.
+    """
+
+    __tablename__ = 'resourcetransformations'
+
+    # The derivative resource. A resource can only be derived from one other resource.
+    derivative_id = Column(
+        Integer, ForeignKey('resources.id'), index=True, primary_key=True)
+
+    # The original resource that was transformed into the derivative.
+    original_id = Column(
+        Integer, ForeignKey('resources.id'), index=True)
+
+    # The settings used for the transformation.
+    settings = Column(MutableDict.as_mutable(JSON), default={})
 
 class Genre(Base, HasFullTableCache):
     """A subject-matter classification for a book.
@@ -5721,7 +6129,7 @@ class Genre(Base, HasFullTableCache):
     """
     __tablename__ = 'genres'
     id = Column(Integer, primary_key=True)
-    name = Column(Unicode)
+    name = Column(Unicode, unique=True, index=True)
 
     # One Genre may have affinity with many Subjects.
     subjects = relationship("Subject", backref="genre")
@@ -5965,15 +6373,35 @@ class Subject(Base):
     def lookup(cls, _db, type, identifier, name, autocreate=True):
         """Turn a subject type and identifier into a Subject."""
         classifier = Classifier.lookup(type)
+        if not type:
+            raise ValueError("Cannot look up Subject with no type.")
+        if not identifier and not name:
+            raise ValueError(
+                "Cannot look up Subject when neither identifier nor name is provided."
+            )
+
+        # An identifier is more reliable than a name, so we would rather
+        # search based on identifier. But if we only have a name, we'll
+        # search based on name.
+        if identifier:
+            find_with = dict(identifier=identifier)
+            create_with = dict(name=name)
+        else:
+            # Type + identifier is unique, but type + name is not
+            # (though maybe it should be). So we need to provide
+            # on_multiple.
+            find_with = dict(name=name, on_multiple='interchangeable')
+            create_with = dict()
+
         if autocreate:
             subject, new = get_one_or_create(
                 _db, Subject, type=type,
-                identifier=identifier,
-                create_method_kwargs=dict(name=name)
+                create_method_kwargs=create_with,
+                **find_with
             )
         else:
+            subject = get_one(_db, Subject, type=type, **find_with)
             new = False
-            subject = get_one(_db, Subject, type=type, identifier=identifier)
         if name and not subject.name:
             # We just discovered the name of a subject that previously
             # had only an ID.
@@ -6047,33 +6475,36 @@ class Subject(Base):
             genre, was_new = Genre.lookup(_db, genredata.name, True)
         else:
             genre = None
+
+        # Create a shorthand way of referring to this Subject in log
+        # messages.
+        parts = [self.type, self.identifier, self.name]
+        shorthand = ":".join(x for x in parts if x)
+
         if genre != self.genre:
             log.info(
-                "%s:%s genre %r=>%r", self.type, self.identifier,
-                self.genre, genre
+                "%s genre %r=>%r", shorthand, self.genre, genre
             )
         self.genre = genre
 
         if audience:
             if self.audience != audience:
                 log.info(
-                    "%s:%s audience %s=>%s", self.type, self.identifier,
-                    self.audience, audience
+                    "%s audience %s=>%s", shorthand, self.audience, audience
                 )
         self.audience = audience
 
         if fiction is not None:
             if self.fiction != fiction:
                 log.info(
-                    "%s:%s fiction %s=>%s", self.type, self.identifier,
-                    self.fiction, fiction
+                    "%s fiction %s=>%s", shorthand, self.fiction, fiction
                 )
         self.fiction = fiction
 
         if (numericrange_to_tuple(self.target_age) != target_age and
             not (not self.target_age and not target_age)):
             log.info(
-                "%s:%s target_age %r=>%r", self.type, self.identifier,
+                "%s target_age %r=>%r", shorthand,
                 self.target_age, tuple_to_numericrange(target_age)
             )
         self.target_age = tuple_to_numericrange(target_age)
@@ -6230,7 +6661,7 @@ class CachedFeed(Base):
         nullable=True, index=True)
 
     # Every feed has a timestamp reflecting when it was created.
-    timestamp = Column(DateTime, nullable=True)
+    timestamp = Column(DateTime, nullable=True, index=True)
 
     # A feed is of a certain type--currently either 'page' or 'groups'.
     type = Column(Unicode, nullable=False)
@@ -6282,9 +6713,10 @@ class CachedFeed(Base):
                 max_age = 0
         if isinstance(max_age, int):
             max_age = datetime.timedelta(seconds=max_age)
+
+        unique_key = None
         if lane and isinstance(lane, Lane):
             lane_id = lane.id
-            unique_key = None
         else:
             lane_id = None
             unique_key = "%s-%s-%s" % (lane.display_name, lane.language_key, lane.audience_key)
@@ -6446,7 +6878,7 @@ class LicensePool(Base):
 
     open_access = Column(Boolean, index=True)
     last_checked = Column(DateTime, index=True)
-    licenses_owned = Column(Integer,default=0)
+    licenses_owned = Column(Integer, default=0, index=True)
     licenses_available = Column(Integer,default=0, index=True)
     licenses_reserved = Column(Integer,default=0)
     patrons_in_hold_queue = Column(Integer,default=0)
@@ -6461,15 +6893,12 @@ class LicensePool(Base):
         UniqueConstraint('identifier_id', 'data_source_id', 'collection_id'),
     )
 
-    @property
-    def delivery_mechanisms(self):
-        """Find all LicensePoolDeliveryMechanisms for this LicensePool.
-        """
-        _db = Session.object_session(self)
-        LPDM = LicensePoolDeliveryMechanism
-        return _db.query(LPDM).filter(
-            LPDM.data_source==self.data_source).filter(
-                LPDM.identifier==self.identifier)
+    delivery_mechanisms = relationship(
+        "LicensePoolDeliveryMechanism",
+        primaryjoin="and_(LicensePool.data_source_id==LicensePoolDeliveryMechanism.data_source_id, LicensePool.identifier_id==LicensePoolDeliveryMechanism.identifier_id)",
+        foreign_keys=(data_source_id, identifier_id),
+        uselist=True,
+    )
 
     def __repr__(self):
         if self.identifier:
@@ -6743,7 +7172,10 @@ class LicensePool(Base):
         )
 
     def add_link(self, rel, href, data_source, media_type=None,
-                 content=None, content_path=None):
+                 content=None, content_path=None, 
+                 rights_status_uri=None, rights_explanation=None,
+                 original_resource=None, transformation_settings=None,
+                 ):
         """Add a link between this LicensePool and a Resource.
 
         :param rel: The relationship between this LicensePool and the resource
@@ -6755,9 +7187,17 @@ class LicensePool(Base):
                resource.
         :param content_path: Path (relative to DATA_DIRECTORY) of the
                representation associated with the resource.
+        :param rights_status_uri: The URI of the RightsStatus for this resource.
+        :param rights_explanation: A free text explanation of why the RightsStatus
+               applies.
+        :param original_resource: Another resource that this resource was derived from.
+        :param transformation_settings: The settings used to transform the original
+               resource into this resource.
         """
         return self.identifier.add_link(
-            rel, href, data_source, media_type, content, content_path)
+            rel, href, data_source, media_type, content, content_path,
+            rights_status_uri, rights_explanation, original_resource,
+            transformation_settings)
 
     def needs_update(self):
         """Is it time to update the circulation info for this license pool?"""
@@ -7047,27 +7487,42 @@ class LicensePool(Base):
         )
         return message, tuple(args)
 
-    def loan_to(self, patron, start=None, end=None, fulfillment=None, external_identifier=None):
-        _db = Session.object_session(patron)
+    def loan_to(self, patron_or_client, start=None, end=None, fulfillment=None, external_identifier=None):
+        _db = Session.object_session(patron_or_client)
         kwargs = dict(start=start or datetime.datetime.utcnow(),
                       end=end)
-        loan, is_new = get_one_or_create(
-            _db, Loan, patron=patron, license_pool=self,
-            create_method_kwargs=kwargs)
+        if isinstance(patron_or_client, Patron):
+            loan, is_new = get_one_or_create(
+                _db, Loan, patron=patron_or_client, license_pool=self,
+                create_method_kwargs=kwargs)
+        else:
+            # An IntegrationClient can have multiple loans, so this always creates
+            # a new loan rather than returning an existing loan.
+            loan, is_new = create(
+                _db, Loan, integration_client=patron_or_client, license_pool=self,
+                create_method_kwargs=kwargs)
         if fulfillment:
             loan.fulfillment = fulfillment
         if external_identifier:
             loan.external_identifier = external_identifier
         return loan, is_new
 
-    def on_hold_to(self, patron, start=None, end=None, position=None):
-        _db = Session.object_session(patron)
-        if not patron.library.allow_holds:
+    def on_hold_to(self, patron_or_client, start=None, end=None, position=None, external_identifier=None):
+        _db = Session.object_session(patron_or_client)
+        if isinstance(patron_or_client, Patron) and not patron_or_client.library.allow_holds:
             raise PolicyException("Holds are disabled for this library.")
         start = start or datetime.datetime.utcnow()
-        hold, new = get_one_or_create(
-            _db, Hold, patron=patron, license_pool=self)
+        if isinstance(patron_or_client, Patron):
+            hold, new = get_one_or_create(
+                _db, Hold, patron=patron_or_client, license_pool=self)
+        else:
+            # An IntegrationClient can have multiple holds, so this always creates
+            # a new hold rather than returning an existing loan.
+            hold, new = create(
+                _db, Hold, integration_client=patron_or_client, license_pool=self)
         hold.update(start, end, position)
+        if external_identifier:
+            hold.external_identifier = external_identifier
         return hold, new
 
     @classmethod
@@ -7095,7 +7550,8 @@ class LicensePool(Base):
 
 
     def calculate_work(
-        self, even_if_no_author=False, known_edition=None, exclude_search=False
+        self, even_if_no_author=False, known_edition=None, exclude_search=False,
+        even_if_no_title=False
     ):
         """Find or create a Work for this LicensePool.
 
@@ -7105,15 +7561,23 @@ class LicensePool(Base):
         of the LicensePool's presentation edition.
 
         :param even_if_no_author: Ordinarily this method will refuse
-        to create a Work for a LicensePool whose Edition has no title
-        or author. But sometimes a book just has no known author. If
+        to create a Work for a LicensePool whose Edition has no
+        author. But sometimes a book just has no known author. If
         that's really the case, pass in even_if_no_author=True and the
         Work will be created.
+
+        :param even_if_no_title: Ordinarily this method will refuse to
+        create a Work for a LicensePool whose Edition has no title.
+        However, in components that don't present information directly
+        to readers, it's sometimes useful to create a Work even if the
+        title is unknown. In that case, pass in even_if_no_title=True
+        and the Work will be created.
 
         TODO: I think known_edition is mostly useless. We should
         either remove it or replace it with a boolean that stops us
         from calling set_presentation_edition() and assumes we've
         already done that work.
+
         """
         if not self.identifier:
             # A LicensePool with no Identifier should never have a Work.
@@ -7147,7 +7611,7 @@ class LicensePool(Base):
         if not presentation_edition.title or not presentation_edition.author:
             presentation_edition.calculate_presentation()
 
-        if not presentation_edition.title:
+        if not presentation_edition.title and not even_if_no_title:
             if presentation_edition.work:
                 logging.warn(
                     "Edition %r has no title but has a Work assigned. This will not stand.", presentation_edition
@@ -7188,7 +7652,7 @@ class LicensePool(Base):
             # merged.
             work, is_new = Work.open_access_for_permanent_work_id(
                 _db, presentation_edition.permanent_work_id,
-                presentation_edition.medium
+                presentation_edition.medium, presentation_edition.language
             )
 
             # Run a sanity check to make sure every LicensePool
@@ -7200,7 +7664,8 @@ class LicensePool(Base):
             # a very long recursive call, so I've put it here.
             work.make_exclusive_open_access_for_permanent_work_id(
                 presentation_edition.permanent_work_id,
-                presentation_edition.medium
+                presentation_edition.medium,
+                presentation_edition.language,
             )
             self.work = work
             licensepools_changed = True
@@ -7209,7 +7674,7 @@ class LicensePool(Base):
         existing_works = set([x.work for x in self.identifier.licensed_through])
         if len(existing_works) > 1:
             logging.warn(
-                "LicensePools for %r have more than one Work between them. Removing them all and starting over."
+                "LicensePools for %r have more than one Work between them. Removing them all and starting over.", self.identifier
             )
             for lp in self.identifier.licensed_through:
                 lp.work = None
@@ -7247,7 +7712,11 @@ class LicensePool(Base):
                     continue
                 if not (self.open_access and pool.open_access):
                     pool.work = None
-                    pool.calculate_work(exclude_search=exclude_search)
+                    pool.calculate_work(
+                        exclude_search=exclude_search,
+                        even_if_no_author=even_if_no_author,
+                        even_if_no_title=even_if_no_title
+                    )
                     licensepools_changed = True
 
         else:
@@ -7328,7 +7797,7 @@ class LicensePool(Base):
             url = None
             resource = self.best_open_access_resource
             if resource and resource.representation:
-                url = resource.representation.mirror_url
+                url = resource.representation.public_url
             self._open_access_download_url = url
         return self._open_access_download_url
 
@@ -7358,8 +7827,8 @@ class LicensePool(Base):
 
             if (best.data_source.name==DataSource.GUTENBERG
                 and resource.data_source.name==DataSource.GUTENBERG
-                and 'noimages' in best.representation.mirror_url
-                and not 'noimages' in resource.representation.mirror_url):
+                and 'noimages' in best.representation.public_url
+                and not 'noimages' in resource.representation.public_url):
                 # A Project Gutenberg-ism: an epub without 'noimages'
                 # in the filename is better than an epub with
                 # 'noimages' in the filename.
@@ -7462,6 +7931,17 @@ class RightsStatus(Base):
         GENERIC_OPEN_ACCESS,
     ]
 
+    # These open access rights allow derivative works to be created, but may
+    # require attribution or prohibit commercial use.
+    ALLOWS_DERIVATIVES = [
+        PUBLIC_DOMAIN_USA,
+        CC0,
+        CC_BY,
+        CC_BY_SA,
+        CC_BY_NC,
+        CC_BY_NC_SA,
+    ]
+
     NAMES = {
         IN_COPYRIGHT: "In Copyright",
         PUBLIC_DOMAIN_USA: "Public domain in the USA",
@@ -7499,6 +7979,9 @@ class RightsStatus(Base):
 
     # One RightsStatus may apply to many LicensePoolDeliveryMechanisms.
     licensepooldeliverymechanisms = relationship("LicensePoolDeliveryMechanism", backref="rights_status")
+
+    # One RightsStatus may apply to many Resources.
+    resources = relationship("Resource", backref="rights_status")
 
     @classmethod
     def lookup(cls, _db, uri):
@@ -7650,7 +8133,7 @@ class Credential(Base):
     patron_id = Column(Integer, ForeignKey('patrons.id'), index=True)
     type = Column(String(255), index=True)
     credential = Column(String)
-    expires = Column(DateTime)
+    expires = Column(DateTime, index=True)
 
     # One Credential can have many associated DRMDeviceIdentifiers.
     drm_device_identifiers = relationship(
@@ -7924,6 +8407,7 @@ class Representation(Base):
     EPUB_MEDIA_TYPE = u"application/epub+zip"
     PDF_MEDIA_TYPE = u"application/pdf"
     MOBI_MEDIA_TYPE = u"application/x-mobipocket-ebook"
+    AMAZON_KF8_MEDIA_TYPE = u"application/x-mobi8-ebook"
     TEXT_XML_MEDIA_TYPE = u"text/xml"
     TEXT_HTML_MEDIA_TYPE = u"text/html"
     APPLICATION_XML_MEDIA_TYPE = u"application/xml"
@@ -7945,6 +8429,7 @@ class Representation(Base):
         PDF_MEDIA_TYPE,
         MOBI_MEDIA_TYPE,
         MP3_MEDIA_TYPE,
+        AMAZON_KF8_MEDIA_TYPE,
     ]
 
     # These media types are in the order we would prefer to use them.
@@ -7987,6 +8472,9 @@ class Representation(Base):
         SCORM_MEDIA_TYPE: "zip"
     }
 
+    COMMON_EBOOK_EXTENSIONS = ['.epub', '.pdf']
+    COMMON_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif']
+
     # Invert FILE_EXTENSIONS and add some extra guesses.
     MEDIA_TYPE_FOR_EXTENSION = {
         ".htm" : TEXT_HTML_MEDIA_TYPE,
@@ -8015,7 +8503,7 @@ class Representation(Base):
     # we tried to fetch the representation
     fetch_exception = Column(Unicode, index=True)
 
-    # A URL under our control to which this representation will be
+    # A URL under our control to which this representation has been
     # mirrored.
     mirror_url = Column(Unicode, index=True)
 
@@ -8103,6 +8591,25 @@ class Representation(Base):
         if self.local_content_path and os.path.exists(self.local_content_path) and self.fetch_exception is None:
             return True
         return False
+
+    @property
+    def public_url(self):
+        """Find the best URL to publish when referencing this Representation
+        in a public space.
+
+        :return: a bytestring
+        """
+        url = None
+        if self.mirror_url:
+            url = self.mirror_url
+        elif self.url:
+            url = self.url
+        elif self.resource:
+            # This really shouldn't happen.
+            url = self.resource.url
+        if isinstance(url, unicode):
+            url = url.encode("utf8")
+        return url
 
     @property
     def is_usable(self):
@@ -8245,7 +8752,7 @@ class Representation(Base):
                 # post response isn't worth caching.
                 response_reviewer((status_code, headers, content))
             exception = None
-            media_type = cls._best_media_type(headers, presumed_media_type)
+            media_type = cls._best_media_type(url, headers, presumed_media_type)
             if isinstance(content, unicode):
                 content = content.encode("utf8")
         except Exception, fetch_exception:
@@ -8329,15 +8836,17 @@ class Representation(Base):
         return representation, False
 
     @classmethod
-    def _best_media_type(cls, headers, default):
+    def _best_media_type(cls, url, headers, default):
         """Determine the most likely media type for the given HTTP headers.
 
         Almost all the time, this is the value of the content-type
         header, if present. However, if the content-type header has a
         really generic value like "application/octet-stream" (as often
         happens with binary files hosted on Github), we'll privilege
-        the default value.
+        the default value. If there's no default value, we'll try to
+        derive one from the URL extension.
         """
+        default = default or cls.guess_media_type(url)
         if not headers or not 'content-type' in headers:
             return default
         headers_type = headers['content-type'].lower()
@@ -8438,10 +8947,14 @@ class Representation(Base):
         self.fetch_exception = None
         self.update_image_size()
 
-    def set_as_mirrored(self):
+    def set_as_mirrored(self, mirror_url):
         """Record the fact that the representation has been mirrored
-        to its .mirror_url.
+        to the given URL.
+
+        This should only be called upon successful completion of the
+        mirror operation.
         """
+        self.mirror_url = mirror_url
         self.mirrored_at = datetime.datetime.utcnow()
         self.mirror_exception = None
 
@@ -8484,6 +8997,111 @@ class Representation(Base):
         headers = dict(headers)
         headers['User-Agent'] = cls.BROWSER_USER_AGENT
         return cls.simple_http_get(url, headers, **kwargs)
+
+    @classmethod
+    def cautious_http_get(cls, url, headers, **kwargs):
+        """Examine the URL we're about to GET, possibly going so far as to
+        perform a HEAD request, to avoid making a request (or
+        following a redirect) to a site known to cause problems.
+
+        The motivating case is that unglue.it contains gutenberg.org
+        links that appear to be direct links to EPUBs, but 1) they're
+        not direct links to EPUBs, and 2) automated requests to
+        gutenberg.org quickly result in IP bans. So we don't make those
+        requests.
+        """
+        do_not_access = kwargs.pop(
+            'do_not_access', cls.AVOID_WHEN_CAUTIOUS_DOMAINS
+        )
+        check_for_redirect = kwargs.pop(
+            'check_for_redirect', cls.EXERCISE_CAUTION_DOMAINS
+        )
+        do_get = kwargs.pop('do_get', cls.simple_http_get)
+        head_client = kwargs.pop('cautious_head_client', requests.head)
+
+        if cls.get_would_be_useful(
+                url, headers, do_not_access, check_for_redirect,
+                head_client
+        ):
+            # Go ahead and make the GET request.
+            return do_get(url, headers, **kwargs)
+        else:
+            logging.info(
+                "Declining to make non-useful HTTP request to %s", url
+            )
+            # 417 Expectation Failed - "... if the server is a proxy,
+            # the server has unambiguous evidence that the request
+            # could not be met by the next-hop server."
+            #
+            # Not quite accurate, but I think it's the closest match
+            # to "the HTTP client decided to not even make your
+            # request".
+            return (
+                417,
+                {"content-type" :
+                 "application/vnd.librarysimplified-did-not-make-request"},
+                "Cautiously decided not to make a GET request to %s" % url
+            )
+
+    # Sites known to host both free books and redirects to a domain in
+    # AVOID_WHEN_CAUTIOUS_DOMAINS.
+    EXERCISE_CAUTION_DOMAINS = ['unglue.it']
+
+    # Sites that cause problems for us if we make automated
+    # HTTP requests to them while trying to find free books.
+    AVOID_WHEN_CAUTIOUS_DOMAINS = ['gutenberg.org', 'books.google.com']
+
+    @classmethod
+    def get_would_be_useful(
+            cls, url, headers, do_not_access=None, check_for_redirect=None,
+            head_client=None
+    ):
+        """Determine whether making a GET request to a given URL is likely to
+        have a useful result.
+
+        :param URL: URL under consideration.
+        :param headers: Headers that would be sent with the GET request.
+        :param do_not_access: Domains to which GET requests are not useful.
+        :param check_for_redirect: Domains to which we should make a HEAD
+            request, in case they redirect to a `do_not_access` domain.
+        :param head_client: Function for making the HEAD request, if
+            one becomes necessary. Should return requests.Response or a mock.
+        """
+        do_not_access = do_not_access or cls.AVOID_WHEN_CAUTIOUS_DOMAINS
+        check_for_redirect = check_for_redirect or cls.EXERCISE_CAUTION_DOMAINS
+        head_client = head_client or requests.head
+
+        def has_domain(domain, check_against):
+            """Is the given `domain` in `check_against`,
+            or maybe a subdomain of one of the domains in `check_against`?
+            """
+            return any(domain == x or domain.endswith('.' + x)
+                       for x in check_against)
+
+        netloc = urlparse.urlparse(url).netloc
+        if has_domain(netloc, do_not_access):
+            # The link points directly to a domain we don't want to
+            # access.
+            return False
+
+        if not has_domain(netloc, check_for_redirect):
+            # We trust this domain not to redirect to a domain we don't
+            # want to access.
+            return True
+
+        # We might be fine, or we might get redirected to a domain we
+        # don't want to access. Make a HEAD request to see what
+        # happens.
+        head_response = head_client(url, headers=headers)
+        if head_response.status_code / 100 != 3:
+            # It's not a redirect. Go ahead and make the GET request.
+            return True
+
+        # Yes, it's a redirect. Does it redirect to a
+        # domain we don't want to access?
+        location = head_response.headers.get('location', '')
+        netloc = urlparse.urlparse(location).netloc
+        return not has_domain(netloc, do_not_access)
 
     @property
     def is_image(self):
@@ -8720,7 +9338,6 @@ class Representation(Base):
         # Because the representation of this image is being
         # changed, it will need to be mirrored later on.
         now = datetime.datetime.utcnow()
-        thumbnail.mirror_url = thumbnail.url
         thumbnail.mirrored_at = None
         thumbnail.mirror_exception = None
 
@@ -8822,6 +9439,21 @@ class Representation(Base):
             quotient *= (1+height_shortfall)
         return quotient
 
+    @property
+    def best_thumbnail(self):
+        """Find the best thumbnail among all the thumbnails associated with
+        this Representation.
+
+        Basically, we prefer a thumbnail that has been mirrored.
+        """
+        champion = None
+        for thumbnail in self.thumbnails:
+            if thumbnail.mirror_url:
+                champion = thumbnail
+                break
+            elif not champion:
+                champion = thumbnail
+        return champion
 
 class DeliveryMechanism(Base, HasFullTableCache):
     """A technique for delivering a book to a patron.
@@ -8865,11 +9497,12 @@ class DeliveryMechanism(Base, HasFullTableCache):
     default_client_can_fulfill_lookup = set([
         (Representation.EPUB_MEDIA_TYPE, NO_DRM),
         (Representation.EPUB_MEDIA_TYPE, ADOBE_DRM),
+        (Representation.EPUB_MEDIA_TYPE, BEARER_TOKEN),
     ])
 
     license_pool_delivery_mechanisms = relationship(
         "LicensePoolDeliveryMechanism",
-        backref="delivery_mechanism"
+        backref="delivery_mechanism",
     )
 
     _cache = HasFullTableCache.RESET
@@ -8960,6 +9593,40 @@ class DeliveryMechanism(Base, HasFullTableCache):
 
         return None
 
+    def compatible_with(self, other, open_access_rules=False):
+        """Can a single loan be fulfilled with both this delivery mechanism
+        and the given one?
+
+        :param other: A DeliveryMechanism
+
+        :param open_access: If this is True, the rules for open-access
+            fulfillment will be applied. If not, the stricted rules
+            for commercial fulfillment will be applied.
+        """
+        if not isinstance(other, DeliveryMechanism):
+            return False
+
+        if self.id == other.id:
+            # The two DeliveryMechanisms are the same.
+            return True
+
+        # Streaming delivery mechanisms can be used even when a
+        # license pool is locked into a non-streaming delivery
+        # mechanism.
+        if self.is_streaming or other.is_streaming:
+            return True
+
+        # For an open-access book, loans are not locked to delivery
+        # mechanisms, so as long as neither delivery mechanism has
+        # DRM, they're compatible.
+        if (open_access_rules and self.drm_scheme==self.NO_DRM
+            and other.drm_scheme==self.NO_DRM):
+            return True
+
+        # For non-open-access books, locking a license pool to a
+        # non-streaming delivery mechanism prohibits the use of any
+        # other non-streaming delivery mechanism.
+        return False
 
 Index("ix_deliverymechanisms_drm_scheme_content_type",
       DeliveryMechanism.drm_scheme,
@@ -8985,11 +9652,11 @@ class CustomList(Base):
     library_id = Column(Integer, ForeignKey('libraries.id'), index=True, nullable=True)
 
     entries = relationship(
-        "CustomListEntry", backref="customlist", lazy="joined")
+        "CustomListEntry", backref="customlist")
 
     __table_args__ = (
         UniqueConstraint('data_source_id', 'foreign_identifier'),
-        UniqueConstraint('data_source_id', 'name', 'library_id'),
+        UniqueConstraint('name', 'library_id'),
     )
 
     # TODO: It should be possible to associate a CustomList with an
@@ -9013,17 +9680,21 @@ class CustomList(Base):
         return _db.query(CustomList).filter(CustomList.data_source_id.in_(ids))
 
     @classmethod
-    def find(cls, _db, source, foreign_identifier_or_name, library=None):
+    def find(cls, _db, foreign_identifier_or_name, data_source=None, library=None):
         """Finds a foreign list in the database by its foreign_identifier
         or its name.
         """
-        source_name = source
-        if isinstance(source, DataSource):
-            source_name = source.name
+        source_name = data_source
+        if isinstance(data_source, DataSource):
+            source_name = data_source.name
         foreign_identifier = unicode(foreign_identifier_or_name)
 
-        qu = _db.query(cls).join(CustomList.data_source).filter(
-            DataSource.name==unicode(source_name),
+        qu = _db.query(cls)
+        if source_name:
+            qu = qu.join(CustomList.data_source).filter(
+                DataSource.name==unicode(source_name))
+
+        qu = qu.filter(
             or_(CustomList.foreign_identifier==foreign_identifier,
                 CustomList.name==foreign_identifier))
         if library:
@@ -9048,7 +9719,16 @@ class CustomList(Base):
         return Work.from_identifiers(_db, identifiers)
 
     def add_entry(self, work_or_edition, annotation=None, first_appearance=None,
-                  featured=None):
+                  featured=None, update_external_index=True):
+        """Add a work to a CustomList.
+
+        :param update_external_index: When a Work is added to a list,
+        its external index needs to be updated. The only reason not to
+        do this is when the current database session already contains
+        a new WorkCoverageRecord for this purpose (e.g. because the
+        Work was just created) and creating another one would violate
+        the workcoveragerecords table's unique constraint.
+        """
         first_appearance = first_appearance or datetime.datetime.utcnow()
         _db = Session.object_session(self)
 
@@ -9056,14 +9736,13 @@ class CustomList(Base):
         if isinstance(work_or_edition, Work):
             edition = work_or_edition.presentation_edition
 
-        existing = list(self.entries_for_work(edition))
+        existing = list(self.entries_for_work(work_or_edition))
         if existing:
             was_new = False
             entry = existing[0]
             if len(existing) > 1:
                 entry.update(_db, equivalent_entries=existing[1:])
             entry.edition = edition
-            _db.commit()
         else:
             entry, was_new = get_one_or_create(
                 _db, CustomListEntry,
@@ -9084,6 +9763,11 @@ class CustomList(Base):
         if was_new:
             self.updated = datetime.datetime.utcnow()
 
+        # Make sure the Work's search document is updated to reflect its new
+        # list membership.
+        if entry.work and update_external_index:
+            entry.work.external_index_needs_updating()
+
         return entry, was_new
 
     def remove_entry(self, work_or_edition):
@@ -9092,12 +9776,13 @@ class CustomList(Base):
         """
         _db = Session.object_session(self)
 
-        edition = work_or_edition
-        if isinstance(work_or_edition, Work):
-            edition = work_or_edition.presentation_edition
-
-        existing_entries = list(self.entries_for_work(edition))
+        existing_entries = list(self.entries_for_work(work_or_edition))
         for entry in existing_entries:
+            if entry.work:
+                # Make sure the Work's search document is updated to
+                # reflect its new list membership.
+                entry.work.external_index_needs_updating()
+
             _db.delete(entry)
 
         if existing_entries:
@@ -9108,15 +9793,35 @@ class CustomList(Base):
         """Find all of the entries in the list representing a particular
         Edition or Work.
         """
-        edition = work_or_edition
         if isinstance(work_or_edition, Work):
+            work = work_or_edition
             edition = work_or_edition.presentation_edition
+        else:
+            edition = work_or_edition
+            work = edition.work
 
-        equivalents = edition.equivalent_editions().all()
+        equivalent_ids = [x.id for x in edition.equivalent_editions()]
 
-        for entry in self.entries:
-            if entry.edition in equivalents:
-                yield entry
+        _db = Session.object_session(work_or_edition)
+        clauses = []
+        if equivalent_ids:
+            clauses.append(CustomListEntry.edition_id.in_(equivalent_ids))
+        if work:
+            clauses.append(CustomListEntry.work==work)
+        if len(clauses) == 0:
+            # This shouldn't happen, but if it does, there can be
+            # no matching results.
+            return _db.query(CustomListEntry).filter(False)
+        elif len(clauses) == 1:
+            clause = clauses[0]
+        else:
+            clause = or_(*clauses)
+
+        qu = _db.query(CustomListEntry).filter(
+            CustomListEntry.customlist==self).filter(
+                clause
+            )
+        return qu
 
 
 class CustomListEntry(Base):
@@ -9198,6 +9903,7 @@ class CustomListEntry(Base):
         """Combines any number of equivalent entries into a single entry
         and updates the edition being used to represent the Work.
         """
+        work = None
         if not equivalent_entries:
             # There are no entries to compare against. Leave it be.
             return
@@ -9247,7 +9953,10 @@ class CustomListEntry(Base):
                 self.annotation = annotations[0]
 
         # Reset the entry's edition to be the Work's presentation edition.
-        best_edition = work.presentation_edition
+        if work:
+            best_edition = work.presentation_edition
+        else:
+            best_edition = None
         if work and not best_edition:
             work.calculate_presentation()
             best_edition = work.presentation_edition
@@ -9265,6 +9974,10 @@ class CustomListEntry(Base):
                 _db.delete(entry)
         _db.commit
 
+# This index dramatically speeds up queries against the materialized
+# view that use custom list membership as a way to cut down on the
+# number of entries returned.
+Index("ix_customlistentries_work_id_list_id", CustomListEntry.work_id, CustomListEntry.list_id)
 
 class Complaint(Base):
     """A complaint about a LicensePool (or, potentially, something else)."""
@@ -9406,6 +10119,9 @@ class Library(Base, HasFullTableCache):
         'Patron', backref='library', cascade="all, delete-orphan"
     )
 
+    # An Library may have many admin roles.
+    adminroles = relationship("AdminRole", backref="library", cascade="all, delete-orphan")
+
     # A Library may have many CachedFeeds.
     cachedfeeds = relationship(
         "CachedFeed", backref="library",
@@ -9496,7 +10212,7 @@ class Library(Base, HasFullTableCache):
         return self._library_registry_short_name
 
     @library_registry_short_name.setter
-    def _set_library_registry_short_name(self, value):
+    def library_registry_short_name(self, value):
         """Uppercase the library registry short name on the way in."""
         if value:
             value = value.upper()
@@ -9574,6 +10290,22 @@ class Library(Base, HasFullTableCache):
             value = 15
         return value
 
+    @property
+    def entrypoints(self):
+        """The EntryPoints enabled for this library."""
+        values = self.setting(EntryPoint.ENABLED_SETTING).json_value
+        if values is None:
+            # No decision has been made about enabled EntryPoints.
+            for cls in EntryPoint.DEFAULT_ENABLED:
+                yield cls
+        else:
+            # It's okay for `values` to be an empty list--that means
+            # the library wants to only use lanes, no entry points.
+            for v in values:
+                cls = EntryPoint.BY_INTERNAL_NAME.get(v)
+                if cls:
+                    yield cls
+
     def enabled_facets(self, group_name):
         """Look up the enabled facets for a given facet group."""
         setting = self.enabled_facets_setting(group_name)
@@ -9593,7 +10325,7 @@ class Library(Base, HasFullTableCache):
         return self.setting(key)
 
     def restrict_to_ready_deliverable_works(
-        self, query, work_model, show_suppressed=False, collection_ids=None
+        self, query, work_model, collection_ids=None, show_suppressed=False,
     ):
         """Restrict a query to show only presentation-ready works present in
         an appropriate collection which the default client can
@@ -9607,50 +10339,16 @@ class Library(Base, HasFullTableCache):
         :param work_model: Either Work or one of the MaterializedWork
         materialized view classes.
 
-        :param show_suppressed: Include titles that have nothing but
-        suppressed LicensePools.
-
         :param collection_ids: Only include titles in the given
         collections.
+
+        :param show_suppressed: Include titles that have nothing but
+        suppressed LicensePools.
         """
         collection_ids = collection_ids or [x.id for x in self.all_collections]
-        # Only find presentation-ready works.
-        #
-        # Such works are automatically filtered out of
-        # the materialized view, but we need to filter them out of Work.
-        if work_model == Work:
-            query = query.filter(
-                work_model.presentation_ready == True,
-            )
-
-        # Only find books that have some kind of DeliveryMechanism.
-        LPDM = LicensePoolDeliveryMechanism
-        exists_clause = exists().where(
-            and_(LicensePool.data_source_id==LPDM.data_source_id,
-                LicensePool.identifier_id==LPDM.identifier_id)
-        )
-        query = query.filter(exists_clause)
-
-        # Only find books with unsuppressed LicensePools.
-        if not show_suppressed:
-            query = query.filter(LicensePool.suppressed==False)
-
-        # Only find books with available licenses.
-        query = query.filter(
-                or_(LicensePool.licenses_owned > 0, LicensePool.open_access)
-        )
-
-        # Only find books in an appropriate collection.
-        query = query.filter(
-            LicensePool.collection_id.in_(collection_ids)
-        )
-
-        # If we don't allow holds, hide any books with no available copies.
-        if not self.allow_holds:
-            query = query.filter(
-                or_(LicensePool.licenses_available > 0, LicensePool.open_access)
-            )
-        return query
+        return Collection.restrict_to_ready_deliverable_works(
+            query, work_model, collection_ids=collection_ids, show_suppressed=show_suppressed,
+            allow_holds=self.allow_holds)
 
     def estimated_holdings_by_language(self, include_open_access=True):
         """Estimate how many titles this library has in various languages.
@@ -9757,7 +10455,7 @@ class Library(Base, HasFullTableCache):
                 library._is_default = False
 
 
-class Admin(Base):
+class Admin(Base, HasFullTableCache):
 
     __tablename__ = 'admins'
 
@@ -9769,6 +10467,15 @@ class Admin(Base):
 
     # Admins can also log in with a local password.
     password_hashed = Column(Unicode, index=True)
+
+    # An Admin may have many roles.
+    roles = relationship("AdminRole", backref="admin", cascade="all, delete-orphan")
+
+    _cache = HasFullTableCache.RESET
+    _id_cache = HasFullTableCache.RESET
+
+    def cache_key(self):
+        return self.email
 
     def update_credentials(self, _db, credential=None):
         if credential:
@@ -9792,7 +10499,10 @@ class Admin(Base):
 
         :return: Admin or None
         """
-        match = get_one(_db, Admin, email=unicode(email))
+        def lookup_hook():
+            return get_one(_db, Admin, email=unicode(email)), False
+
+        match, ignore = Admin.by_cache_key(_db, unicode(email), lookup_hook)
         if match and not match.has_password(password):
             # Admin with this email was found, but password is invalid.
             match = None
@@ -9803,6 +10513,118 @@ class Admin(Base):
         """Get Admins that have a password."""
         return _db.query(Admin).filter(Admin.password_hashed != None)
 
+    def is_system_admin(self):
+        _db = Session.object_session(self)
+        def lookup_hook():
+            return get_one(_db, AdminRole, admin=self, role=AdminRole.SYSTEM_ADMIN), False
+        role, ignore = AdminRole.by_cache_key(_db, (self.id, None, AdminRole.SYSTEM_ADMIN), lookup_hook)
+        if role:
+            return True
+        return False
+
+    def is_sitewide_library_manager(self):
+        _db = Session.object_session(self)
+        if self.is_system_admin():
+            return True
+        def lookup_hook():
+            return get_one(_db, AdminRole, admin=self, role=AdminRole.SITEWIDE_LIBRARY_MANAGER), False
+        role, ignore = AdminRole.by_cache_key(_db, (self.id, None, AdminRole.SITEWIDE_LIBRARY_MANAGER), lookup_hook)
+        if role:
+            return True
+        return False
+
+    def is_sitewide_librarian(self):
+        _db = Session.object_session(self)
+        if self.is_sitewide_library_manager():
+            return True
+        def lookup_hook():
+            return get_one(_db, AdminRole, admin=self, role=AdminRole.SITEWIDE_LIBRARIAN), False
+        role, ignore = AdminRole.by_cache_key(_db, (self.id, None, AdminRole.SITEWIDE_LIBRARIAN), lookup_hook)
+        if role:
+            return True
+        return False
+
+    def is_library_manager(self, library):
+        _db = Session.object_session(self)
+        # First check if the admin is a manager of _all_ libraries.
+        if self.is_sitewide_library_manager():
+            return True
+        # If not, they could stil be a manager of _this_ library.
+        def lookup_hook():
+            return get_one(_db, AdminRole, admin=self, library=library, role=AdminRole.LIBRARY_MANAGER), False
+        role, ignore = AdminRole.by_cache_key(_db, (self.id, library.id, AdminRole.LIBRARY_MANAGER), lookup_hook)
+        if role:
+            return True
+        return False
+
+    def is_librarian(self, library):
+        _db = Session.object_session(self)
+        # If the admin is a library manager, they can do everything a librarian can do.
+        if self.is_library_manager(library):
+            return True
+        # Check if the admin is a librarian for _all_ libraries.
+        if self.is_sitewide_librarian():
+            return True
+        # If not, they might be a librarian of _this_ library.
+        def lookup_hook():
+            return get_one(_db, AdminRole, admin=self, library=library, role=AdminRole.LIBRARIAN), False
+        role, ignore = AdminRole.by_cache_key(_db, (self.id, library.id, AdminRole.LIBRARIAN), lookup_hook)
+        if role:
+            return True
+        return False
+
+    def add_role(self, role, library=None):
+        _db = Session.object_session(self)
+        role, is_new = get_one_or_create(_db, AdminRole, admin=self, role=role, library=library)
+        return role
+
+    def remove_role(self, role, library=None):
+        _db = Session.object_session(self)
+        role = get_one(_db, AdminRole, admin=self, role=role, library=library)
+        if role:
+            _db.delete(role)
+
+    def __repr__(self):
+        return u"<Admin: email=%s>" % self.email
+
+class AdminRole(Base, HasFullTableCache):
+
+    __tablename__ = 'adminroles'
+
+    id = Column(Integer, primary_key=True)
+    admin_id = Column(Integer, ForeignKey("admins.id"), nullable=False, index=True)
+    library_id = Column(Integer, ForeignKey("libraries.id"), nullable=True, index=True)
+    role = Column(Unicode, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('admin_id', 'library_id', 'role'),
+    )
+
+    SYSTEM_ADMIN = "system"
+    SITEWIDE_LIBRARY_MANAGER = "manager-all"
+    LIBRARY_MANAGER = "manager"
+    SITEWIDE_LIBRARIAN = "librarian-all"
+    LIBRARIAN = "librarian"
+
+    ROLES = [SYSTEM_ADMIN, SITEWIDE_LIBRARY_MANAGER, LIBRARY_MANAGER, SITEWIDE_LIBRARIAN, LIBRARIAN]
+
+    _cache = HasFullTableCache.RESET
+    _id_cache = HasFullTableCache.RESET
+
+    def cache_key(self):
+        return (self.admin_id, self.library_id, self.role)
+
+    def to_dict(self):
+        if self.library:
+            return dict(role=self.role, library=self.library.short_name)
+        return dict(role=self.role)
+
+    def __repr__(self):
+        return u"<AdminRole: role=%s library=%s admin=%s>" % (
+            self.role, (self.library and self.library.short_name), self.admin.email)
+
+
+Index("ix_adminroles_admin_id_library_id_role", AdminRole.admin_id, AdminRole.library_id, AdminRole.role)
 
 class ExternalIntegration(Base, HasFullTableCache):
 
@@ -9832,7 +10654,7 @@ class ExternalIntegration(Base, HasFullTableCache):
 
     # These integrations are associated with external services such as
     # S3 that provide access to book covers.
-    STORAGE_GOAL = u'storage'
+    STORAGE_GOAL = MirrorUploader.STORAGE_GOAL
 
     # These integrations are associated with external services like
     # Cloudfront or other CDNs that mirror and/or cache certain domains.
@@ -9868,17 +10690,20 @@ class ExternalIntegration(Base, HasFullTableCache):
     ONE_CLICK = RB_DIGITAL
     OPDS_FOR_DISTRIBUTORS = u'OPDS for Distributors'
     ENKI = DataSource.ENKI
+    FEEDBOOKS = DataSource.FEEDBOOKS
+    MANUAL = DataSource.MANUAL
 
-    # These protocols are only used on the Content Server when mirroring
+    # These protocols were used on the Content Server when mirroring
     # content from a given directory or directly from Project
-    # Gutenberg, respectively. These protocols aren't intended for use
-    # with LicensePools on the Circulation Manager.
-    DIRECTORY_IMPORT = u'Directory Import'
+    # Gutenberg, respectively. DIRECTORY_IMPORT was replaced by
+    # MANUAL.  GUTENBERG has yet to be replaced, but will eventually
+    # be moved into LICENSE_PROTOCOLS.
+    DIRECTORY_IMPORT = "Directory Import"
     GUTENBERG = DataSource.GUTENBERG
 
     LICENSE_PROTOCOLS = [
         OPDS_IMPORT, OVERDRIVE, ODILO, BIBLIOTHECA, AXIS_360, RB_DIGITAL,
-        DIRECTORY_IMPORT, GUTENBERG, ENKI,
+        GUTENBERG, ENKI, MANUAL
     ]
 
     # Some integrations with LICENSE_GOAL imply that the data and
@@ -9890,6 +10715,7 @@ class ExternalIntegration(Base, HasFullTableCache):
         AXIS_360 : DataSource.AXIS_360,
         RB_DIGITAL : DataSource.RB_DIGITAL,
         ENKI : DataSource.ENKI,
+        FEEDBOOKS : DataSource.FEEDBOOKS,
     }
 
     # Integrations with METADATA_GOAL
@@ -9902,7 +10728,7 @@ class ExternalIntegration(Base, HasFullTableCache):
     CONTENT_SERVER = u'Content Server'
 
     # Integrations with STORAGE_GOAL
-    S3 = u'S3'
+    S3 = u'Amazon S3'
 
     # Integrations with CDN_GOAL
     CDN = u'CDN'
@@ -9967,6 +10793,20 @@ class ExternalIntegration(Base, HasFullTableCache):
         lazy="joined", cascade="all, delete-orphan",
     )
 
+    # Any number of Collections may designate an ExternalIntegration
+    # as the source of their configuration
+    collections = relationship(
+        "Collection", backref="_external_integration",
+        foreign_keys='Collection.external_integration_id',
+    )
+
+    # An ExternalIntegration may be used by many Collections
+    # to mirror book covers or other files.
+    mirror_for = relationship(
+        "Collection", backref="mirror_integration",
+        foreign_keys='Collection.mirror_integration_id',
+    )
+
     def __repr__(self):
         return u"<ExternalIntegration: protocol=%s goal='%s' settings=%d ID=%d>" % (
             self.protocol, self.goal, len(self.settings), self.id)
@@ -10009,6 +10849,40 @@ class ExternalIntegration(Base, HasFullTableCache):
         admin_auth = get_one(_db, cls, goal=cls.ADMIN_AUTH_GOAL)
         return admin_auth
 
+    @classmethod
+    def for_library_and_goal(cls, _db, library, goal):
+        """Find all ExternalIntegrations associated with the given
+        Library and the given goal.
+
+        :return: A Query.
+        """
+        return _db.query(ExternalIntegration).join(
+            ExternalIntegration.libraries
+        ).filter(
+            ExternalIntegration.goal==goal
+        ).filter(
+            Library.id==library.id
+        )
+
+    @classmethod
+    def one_for_library_and_goal(cls, _db, library, goal):
+        """Find the ExternalIntegration associated with the given
+        Library and the given goal.
+
+        :return: An ExternalIntegration, or None.
+        :raise: CannotLoadConfiguration
+        """
+        integrations = cls.for_library_and_goal(_db, library, goal).all()
+        if len(integrations) == 0:
+            return None
+        if len(integrations) > 1:
+            raise CannotLoadConfiguration(
+                "Library %s defines multiple integrations with goal %s!" % (
+                    library.name, goal
+                )
+            )
+        return integrations[0]
+
     def set_setting(self, key, value):
         """Create or update a key-value setting for this ExternalIntegration."""
         setting = self.setting(key)
@@ -10030,7 +10904,7 @@ class ExternalIntegration(Base, HasFullTableCache):
         return self.setting(self.URL).value
 
     @url.setter
-    def set_url(self, new_url):
+    def url(self, new_url):
         self.set_setting(self.URL, new_url)
 
     @hybrid_property
@@ -10038,7 +10912,7 @@ class ExternalIntegration(Base, HasFullTableCache):
         return self.setting(self.USERNAME).value
 
     @username.setter
-    def set_username(self, new_username):
+    def username(self, new_username):
         self.set_setting(self.USERNAME, new_username)
 
     @hybrid_property
@@ -10046,7 +10920,7 @@ class ExternalIntegration(Base, HasFullTableCache):
         return self.setting(self.PASSWORD).value
 
     @password.setter
-    def set_password(self, new_password):
+    def password(self, new_password):
         return self.set_setting(self.PASSWORD, new_password)
 
     def explain(self, library=None, include_secrets=False):
@@ -10251,7 +11125,7 @@ class ConfigurationSetting(Base, HasFullTableCache):
         return self._value
 
     @value.setter
-    def set_value(self, new_value):
+    def value(self, new_value):
         if new_value is not None:
             new_value = unicode(new_value)
         self._value = new_value
@@ -10370,6 +11244,14 @@ class Collection(Base, HasFullTableCache):
     # external_account_id.
     parent_id = Column(Integer, ForeignKey('collections.id'), index=True)
 
+    # Some Collections use an ExternalIntegration to mirror books and
+    # cover images they discover. Such a collection should use an
+    # ExternalIntegration to set up its mirroring technique, and keep
+    # a reference to that ExternalIntegration here.
+    mirror_integration_id = Column(
+        Integer, ForeignKey('externalintegrations.id'), nullable=True
+    )
+
     # A collection may have many child collections. For example,
     # An Overdrive collection may have many children corresponding
     # to Overdrive Advantage collections.
@@ -10404,6 +11286,16 @@ class Collection(Base, HasFullTableCache):
     coverage_records = relationship(
         "CoverageRecord", backref="collection",
         cascade="all"
+    )
+
+    # A collection may be associated with one or more custom lists.
+    # When a new license pool is added to the collection, it will
+    # also be added to the list. Admins can remove items from the
+    # the list and they won't be added back, so the list doesn't
+    # necessarily match the collection.
+    customlists = relationship(
+        "CustomList", secondary=lambda: collections_customlists,
+        backref="collections"
     )
 
     _cache = HasFullTableCache.RESET
@@ -10501,7 +11393,7 @@ class Collection(Base, HasFullTableCache):
         return self.external_integration.protocol
 
     @protocol.setter
-    def set_protocol(self, new_protocol):
+    def protocol(self, new_protocol):
         """Modify the protocol in use by this Collection."""
         if self.parent and self.parent.protocol != new_protocol:
             raise ValueError(
@@ -10541,11 +11433,14 @@ class Collection(Base, HasFullTableCache):
             key = self.AUDIOBOOK_LOAN_DURATION_KEY
         else:
             key = self.EBOOK_LOAN_DURATION_KEY
-        return (
-            ConfigurationSetting.for_library_and_externalintegration(
-                _db, key, library, self.external_integration
+        if isinstance(library, Library):
+            return (
+                ConfigurationSetting.for_library_and_externalintegration(
+                    _db, key, library, self.external_integration
+                )
             )
-        )
+        elif isinstance(library, IntegrationClient):
+            return self.external_integration.setting(key)
 
 
     DEFAULT_RESERVATION_PERIOD_KEY = 'default_reservation_period'
@@ -10564,7 +11459,7 @@ class Collection(Base, HasFullTableCache):
         )
 
     @default_reservation_period.setter
-    def set_default_reservation_period(self, new_value):
+    def default_reservation_period(self, new_value):
         new_value = int(new_value)
         self.external_integration.setting(
             self.DEFAULT_RESERVATION_PERIOD_KEY).value = str(new_value)
@@ -10606,12 +11501,15 @@ class Collection(Base, HasFullTableCache):
         from_metadata_identifier both create ExternalIntegrations for the
         Collections they create.
         """
+        # We don't enforce this on the database level because it is
+        # legitimate for a newly created Collection to have no
+        # ExternalIntegration. But by the time it's being used for real,
+        # it needs to have one.
         if not self.external_integration_id:
             raise ValueError(
                 "No known external integration for collection %s" % self.name
             )
-        _db = Session.object_session(self)
-        return ExternalIntegration.by_id(_db, self.external_integration_id)
+        return self._external_integration
 
     @property
     def unique_account_id(self):
@@ -10792,19 +11690,55 @@ class Collection(Base, HasFullTableCache):
         _db.bulk_insert_mappings(CollectionIdentifier, new_catalog_entries)
         _db.commit()
 
+    def unresolved_catalog(self, _db, data_source_name, operation):
+        """Returns a query with all identifiers in a Collection's catalog that
+        have unsuccessfully attempted resolution. This method is used on the
+        metadata wrangler.
+
+        :return: a sqlalchemy.Query
+        """
+        coverage_source = DataSource.lookup(_db, data_source_name)
+        is_not_resolved = and_(
+            CoverageRecord.operation==operation,
+            CoverageRecord.data_source_id==coverage_source.id,
+            CoverageRecord.status!=CoverageRecord.SUCCESS,
+        )
+
+        query = _db.query(Identifier)\
+            .outerjoin(Identifier.licensed_through)\
+            .outerjoin(Identifier.coverage_records)\
+            .outerjoin(LicensePool.work).outerjoin(Identifier.collections)\
+            .filter(
+                Collection.id==self.id, is_not_resolved, Work.id==None
+            ).order_by(Identifier.id)
+
+        return query
+
     def works_updated_since(self, _db, timestamp):
         """Finds all works in a collection's catalog that have been updated
            since the timestamp. Used in the metadata wrangler.
 
-           :return: a Query
+           :return: a Query that yields (Work, LicensePool,
+              Identifier) 3-tuples. This gives caller all the
+              information necessary to create full OPDS entries for
+              the works.
         """
         opds_operation = WorkCoverageRecord.GENERATE_OPDS_OPERATION
-        qu = _db.query(Work).join(Work.coverage_records)\
-            .join(Work.license_pools).join(Identifier)\
-            .join(Identifier.collections).filter(
-                Collection.id==self.id,
-                WorkCoverageRecord.operation==opds_operation,
-            ).options(joinedload(Work.license_pools, LicensePool.identifier))
+        qu = _db.query(
+            Work, LicensePool, Identifier
+        ).join(
+            Work.coverage_records,
+        ).join(
+            Identifier.collections,
+        )
+        qu = qu.filter(
+            Work.id==WorkCoverageRecord.work_id,
+            Work.id==LicensePool.work_id,
+            LicensePool.identifier_id==Identifier.id,
+            WorkCoverageRecord.operation==opds_operation,
+            CollectionIdentifier.identifier_id==Identifier.id,
+            CollectionIdentifier.collection_id==self.id
+        ).options(joinedload(Work.license_pools, LicensePool.identifier))
 
         if timestamp:
             qu = qu.filter(
@@ -10836,6 +11770,70 @@ class Collection(Base, HasFullTableCache):
             isbns = isbns.filter(CoverageRecord.timestamp > timestamp)
 
         return isbns
+
+    @classmethod
+    def restrict_to_ready_deliverable_works(
+        cls, query, work_model, collection_ids=None, show_suppressed=False,
+        allow_holds=True,
+    ):
+        """Restrict a query to show only presentation-ready works present in
+        an appropriate collection which the default client can
+        fulfill.
+
+        Note that this assumes the query has an active join against
+        LicensePool.
+
+        :param query: The query to restrict.
+
+        :param work_model: Either Work or one of the MaterializedWork
+        materialized view classes.
+
+        :param show_suppressed: Include titles that have nothing but
+        suppressed LicensePools.
+
+        :param collection_ids: Only include titles in the given
+        collections.
+
+        :param allow_holds: If false, pools with no available copies
+        will be hidden.
+        """
+        # Only find presentation-ready works.
+        #
+        # Such works are automatically filtered out of
+        # the materialized view, but we need to filter them out of Work.
+        if work_model == Work:
+            query = query.filter(
+                work_model.presentation_ready == True,
+            )
+
+        # Only find books that have some kind of DeliveryMechanism.
+        LPDM = LicensePoolDeliveryMechanism
+        exists_clause = exists().where(
+            and_(LicensePool.data_source_id==LPDM.data_source_id,
+                LicensePool.identifier_id==LPDM.identifier_id)
+        )
+        query = query.filter(exists_clause)
+
+        # Only find books with unsuppressed LicensePools.
+        if not show_suppressed:
+            query = query.filter(LicensePool.suppressed==False)
+
+        # Only find books with available licenses.
+        query = query.filter(
+                or_(LicensePool.licenses_owned > 0, LicensePool.open_access)
+        )
+
+        # Only find books in an appropriate collection.
+        query = query.filter(
+            LicensePool.collection_id.in_(collection_ids)
+        )
+
+        # If we don't allow holds, hide any books with no available copies.
+        if not allow_holds:
+            query = query.filter(
+                or_(LicensePool.licenses_available > 0, LicensePool.open_access)
+            )
+        return query
 
 
 collections_libraries = Table(
@@ -10890,6 +11888,48 @@ mapper(
     )
 )
 
+collections_customlists = Table(
+    'collections_customlists', Base.metadata,
+    Column(
+        'collection_id', Integer, ForeignKey('collections.id'),
+        index=True, nullable=False,
+    ),
+    Column(
+        'customlist_id', Integer, ForeignKey('customlists.id'),
+        index=True, nullable=False,
+    ),
+    UniqueConstraint('collection_id', 'customlist_id'),
+)
+
+# When a pool gets a work and a presentation edition for the first time,
+# the work should be added to any custom lists associated with the pool's
+# collection.
+# In some cases, the work may be generated before the presentation edition.
+# Then we need to add it when the work gets a presentation edition.
+@event.listens_for(LicensePool.work_id, 'set')
+@event.listens_for(Work.presentation_edition_id, 'set')
+def add_work_to_customlists_for_collection(pool_or_work, value, oldvalue, initiator):
+    if isinstance(pool_or_work, LicensePool):
+        work = pool_or_work.work
+        pools = [pool_or_work]
+    else:
+        work = pool_or_work
+        pools = work.license_pools
+
+    if (not oldvalue or oldvalue is NO_VALUE) and value and work and work.presentation_edition:
+        for pool in pools:
+            if not pool.collection:
+                # This shouldn't happen, but don't crash if it does --
+                # the correct behavior is that the work not be added to
+                # any CustomLists.
+                continue
+            for list in pool.collection.customlists:
+                # Since the work was just created, we can assume that
+                # there's already a pending registration for updating the
+                # work's internal index, and decide not to create a
+                # second one.
+                list.add_entry(work, featured=True, update_external_index=False)
+
 class IntegrationClient(Base):
     """A client that has authenticated access to this application.
 
@@ -10909,25 +11949,39 @@ class IntegrationClient(Base):
     created = Column(DateTime)
     last_accessed = Column(DateTime)
 
+    loans = relationship('Loan', backref='integration_client')
+    holds = relationship('Hold', backref='integration_client')
+
     def __repr__(self):
         return (u"<IntegrationClient: URL=%s ID=%s>" % (self.url, self.id)).encode('utf8')
 
     @classmethod
-    def register(cls, _db, url, submitted_secret=None):
-        """Creates a new server with client details."""
+    def for_url(cls, _db, url):
+        """Finds the IntegrationClient for the given server URL.
+
+        :return: an IntegrationClient. If it didn't already exist,
+        it will be created. If it didn't already have a secret, no
+        secret will be set.
+        """
         url = cls.normalize_url(url)
         now = datetime.datetime.utcnow()
         client, is_new = get_one_or_create(
             _db, cls, url=url, create_method_kwargs=dict(created=now)
         )
         client.last_accessed = now
+        return client, is_new
+
+    @classmethod
+    def register(cls, _db, url, submitted_secret=None):
+        """Creates a new server with client details."""
+        client, is_new = cls.for_url(_db, url)
 
         if not is_new and (not submitted_secret or submitted_secret != client.shared_secret):
             raise ValueError('Cannot update existing IntegratedClient without valid shared_secret')
 
         generate_secret = (client.shared_secret is None) or submitted_secret
         if generate_secret:
-            client.shared_secret = unicode(os.urandom(24).encode('hex'))
+            client.randomize_secret()
 
         return client, is_new
 
@@ -10949,6 +12003,8 @@ class IntegrationClient(Base):
             return client
         return None
 
+    def randomize_secret(self):
+        self.shared_secret = unicode(os.urandom(24).encode('hex'))
 
 from sqlalchemy.sql import compiler
 from psycopg2.extensions import adapt as sqlescape
@@ -10985,6 +12041,7 @@ def tuple_to_numericrange(t):
         return None
     return NumericRange(t[0], t[1], '[]')
 
+site_configuration_has_changed_lock = RLock()
 def site_configuration_has_changed(_db, timeout=1):
     """Call this whenever you want to indicate that the site configuration
     has changed and needs to be reloaded.
@@ -11000,6 +12057,20 @@ def site_configuration_has_changed(_db, timeout=1):
     number of seconds since the last site configuration change was
     recorded.
     """
+    has_lock = site_configuration_has_changed_lock.acquire(blocking=False)
+    if not has_lock:
+        # Another thread is updating site configuration right now.
+        # There is no need to do anything--the timestamp will still be
+        # accurate.
+        return
+
+    try:
+        _site_configuration_has_changed(_db, timeout)
+    finally:
+        site_configuration_has_changed_lock.release()
+
+def _site_configuration_has_changed(_db, timeout=1):
+    """Actually changes the timestamp on the site configuration."""
     now = datetime.datetime.utcnow()
     last_update = Configuration._site_configuration_last_update()
     if not last_update or (now - last_update).total_seconds() > timeout:
@@ -11014,11 +12085,12 @@ def site_configuration_has_changed(_db, timeout=1):
 
         # Update the timestamp.
         now = datetime.datetime.utcnow()
-        sql = "UPDATE timestamps SET timestamp=:timestamp WHERE service=:service AND collection_id IS NULL;"
+        earlier = now-datetime.timedelta(seconds=timeout)
+        sql = "UPDATE timestamps SET timestamp=:timestamp WHERE service=:service AND collection_id IS NULL AND timestamp<=:earlier;"
         _db.execute(
             text(sql),
             dict(service=Configuration.SITE_CONFIGURATION_CHANGED,
-                 timestamp=now)
+                 timestamp=now, earlier=earlier)
         )
 
         # Update the Configuration's record of when the configuration
@@ -11055,7 +12127,7 @@ def licensepool_collection_change(target, value, oldvalue, initiator):
 
 @event.listens_for(LicensePool.licenses_owned, 'set')
 def licenses_owned_change(target, value, oldvalue, initiator):
-    """A Work may need to have its search document re-indexed if one of 
+    """A Work may need to have its search document re-indexed if one of
     its LicensePools changes the number of licenses_owned to or from zero.
     """
     work = target.work
@@ -11073,7 +12145,7 @@ def licenses_owned_change(target, value, oldvalue, initiator):
 
 @event.listens_for(LicensePool.open_access, 'set')
 def licensepool_open_access_change(target, value, oldvalue, initiator):
-    """A Work may need to have its search document re-indexed if one of 
+    """A Work may need to have its search document re-indexed if one of
     its LicensePools changes its open-access status.
 
     This shouldn't ever happen.
@@ -11134,6 +12206,22 @@ def configuration_relevant_lifecycle_event(mapper, connection, target):
 def configuration_relevant_update(mapper, connection, target):
     if directly_modified(target):
         site_configuration_has_changed(target)
+
+@event.listens_for(Admin, 'after_insert')
+@event.listens_for(Admin, 'after_delete')
+@event.listens_for(Admin, 'after_update')
+def refresh_admin_cache(mapper, connection, target):
+    # The next time someone tries to access an Admin,
+    # the cache will be repopulated.
+    Admin.reset_cache()
+
+@event.listens_for(AdminRole, 'after_insert')
+@event.listens_for(AdminRole, 'after_delete')
+@event.listens_for(AdminRole, 'after_update')
+def refresh_admin_role_cache(mapper, connection, target):
+    # The next time someone tries to access an AdminRole,
+    # the cache will be repopulated.
+    AdminRole.reset_cache()
 
 @event.listens_for(Collection, 'after_insert')
 @event.listens_for(Collection, 'after_delete')

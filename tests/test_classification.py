@@ -26,7 +26,9 @@ from classifier import (
     AgeOrGradeClassifier,
     InterestLevelClassifier,
     Axis360AudienceClassifier,
+    Lowercased,
     WorkClassifier,
+    Lowercased,
     fiction_genres,
     nonfiction_genres,
     GenreData,
@@ -34,6 +36,30 @@ from classifier import (
 
 genres = dict()
 GenreData.populate(globals(), genres, fiction_genres, nonfiction_genres)
+
+
+class TestLowercased(object):
+
+    def test_constructor(self):
+
+        l = Lowercased("A string")
+
+        # A string is lowercased.
+        eq_("a string", l)
+
+        # A Lowercased object is returned rather than creating a new
+        # object.
+        assert Lowercased(l) is l
+
+        # A number such as a Dewey Decimal number is converted to a string.
+        eq_(u"301", Lowercased(301))
+
+        # A trailing period is removed.
+        l = Lowercased("A string.")
+        eq_("a string", l)
+
+        # The original value is still available.
+        eq_("A string.", l.original)
 
 
 class TestGenreData(object):
@@ -131,6 +157,16 @@ class TestClassifier(object):
         m = SetsNameForOneIdentifier.scrub_identifier_and_name
         eq_(("A", "USE THIS NAME!"), m("A", "name a"))
         eq_(("B", "NAME B"), m("B", "name b"))
+
+    def test_scrub_identifier(self):
+        m = Classifier.scrub_identifier
+        eq_(None, m(None))
+        eq_(Lowercased("Foo"), m("Foo"))
+
+    def test_scrub_name(self):
+        m = Classifier.scrub_name
+        eq_(None, m(None))
+        eq_(Lowercased("Foo"), m("Foo"))
 
 
 class TestClassifierLookup(object):
@@ -327,7 +363,7 @@ class TestDewey(object):
         young_adult = Classifier.AUDIENCE_YOUNG_ADULT
 
         def aud(identifier):
-            return DDC.audience(DDC.scrub_identifier(identifier), None)
+            return DDC.audience(*DDC.scrub_identifier(identifier))
 
         eq_(child, aud("JB"))
         eq_(child, aud("J300"))
@@ -343,7 +379,7 @@ class TestDewey(object):
     def test_is_fiction(self):
 
         def fic(identifier):
-            return DDC.is_fiction(DDC.scrub_identifier(identifier), None)
+            return DDC.is_fiction(*DDC.scrub_identifier(identifier))
 
         eq_(True, fic("FIC"))
         eq_(True, fic("E"))
@@ -358,7 +394,8 @@ class TestDewey(object):
 
     def test_classification(self):
         def c(identifier):
-            i = DDC.scrub_identifier(identifier)
+            i, name = DDC.scrub_identifier(identifier)
+            eq_(name, None)
             return DDC.genre(i, None)
 
         eq_(classifier.Folklore, c("398"))
@@ -778,6 +815,16 @@ class TestWorkClassifier(DatabaseTest):
         expected_genre, ignore = Genre.lookup(self._db, genre_data.name)
         return expected_genre
 
+    def test_no_assumptions(self):
+        """If we have no data whatsoever, we make no assumptions
+        about a work's classification.
+        """
+        self.classifier.weigh_metadata()
+        eq_(None, self.classifier.fiction())
+        eq_(None, self.classifier.audience())
+        eq_({}, self.classifier.genres(None))
+        eq_((None, None), self.classifier.target_age(None))
+
     def test_weight_metadata_title(self):
         self.work.presentation_edition.title = u"Star Trek: The Book"
         expected_genre = self._genre(classifier.Media_Tie_in_SF)
@@ -901,17 +948,6 @@ class TestWorkClassifier(DatabaseTest):
         self.classifier.add(c)
         eq_(50000, self.classifier.audience_weights[Classifier.AUDIENCE_CHILDREN])
 
-    def test_default_nonfiction(self):
-        # In the absence of any information we assume a book is nonfiction.
-        eq_(False, self.classifier.fiction())
-
-        # Put a tiny bit of evidence on the scale, and the balance tips.
-        new_classifier = WorkClassifier(self.work, test_session=self._db) 
-        source = DataSource.lookup(self._db, DataSource.OCLC)
-        c = self.identifier.classify(source, Subject.TAG, u"Fiction", weight=1)
-        new_classifier.add(c)
-        eq_(True, new_classifier.fiction())
-
     def test_juvenile_classification_is_split_between_children_and_ya(self):
 
         # LCC files both children's and YA works under 'PZ'.
@@ -950,9 +986,6 @@ class TestWorkClassifier(DatabaseTest):
         # cause the work to be mistakenly classified as Adult.
         for aud in Classifier.AUDIENCES_ADULT:
             eq_(-50, weights[aud])
-
-    def test_adult_book_by_default(self):
-        eq_(Classifier.AUDIENCE_ADULT, self.classifier.audience())
 
     def test_childrens_book_when_evidence_is_overwhelming(self):
         # There is some evidence in the 'adult' and 'adults only'
@@ -1239,7 +1272,7 @@ class TestWorkClassifier(DatabaseTest):
         eq_(False, fiction)
 
     def test_classify_uses_default_audience(self):
-        genres, fiction, audience, target_age = self.classifier.classify(default_audience=None)
+        genres, fiction, audience, target_age = self.classifier.classify()
         eq_(None, audience)
         genres, fiction, audience, target_age = self.classifier.classify(default_audience=Classifier.AUDIENCE_ADULT)
         eq_(Classifier.AUDIENCE_ADULT, audience)
@@ -1382,7 +1415,8 @@ class TestWorkClassifier(DatabaseTest):
         eq_(True, fiction)
 
     def test_staff_audience_overrides_others(self):
-        source = DataSource.lookup(self._db, DataSource.AXIS_360)
+        pool = self._licensepool(None, data_source_name=DataSource.AXIS_360)
+        license_source = pool.data_source
         staff_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
         subject1 = self._subject(type="type1", identifier="subject1")
         subject1.audience = "Adult"
@@ -1393,13 +1427,13 @@ class TestWorkClassifier(DatabaseTest):
             identifier="Children"
         )
         classification1 = self._classification(
-            identifier=self.identifier, subject=subject1,
-            data_source=source, weight=10)
+            identifier=pool.identifier, subject=subject1,
+            data_source=license_source, weight=10)
         classification2 = self._classification(
-            identifier=self.identifier, subject=subject2,
-            data_source=source, weight=10)
+            identifier=pool.identifier, subject=subject2,
+            data_source=license_source, weight=10)
         classification3 = self._classification(
-            identifier=self.identifier, subject=subject3,
+            identifier=pool.identifier, subject=subject3,
             data_source=staff_source, weight=1)
         self.classifier.add(classification1)
         self.classifier.add(classification2)

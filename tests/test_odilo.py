@@ -1,8 +1,12 @@
 # encoding: utf-8
 from nose.tools import (
-    assert_raises_regexp, eq_, ok_
+    assert_raises_regexp, 
+    eq_, 
+    ok_,
+    set_trace,
 )
 
+import datetime
 import os
 import json
 
@@ -25,7 +29,10 @@ from model import (
     Hyperlink,
 )
 
-from testing import DatabaseTest
+from testing import (
+    DatabaseTest,
+    MockRequestsResponse,
+)
 
 
 class OdiloTest(DatabaseTest):
@@ -101,12 +108,68 @@ class TestOdiloAPI(OdiloTestWithAPI):
         self.api.access_token_response = self.api.mock_access_token_response(
             "new bearer token"
         )
-
         self.api.refresh_creds(credential)
         eq_("new bearer token", credential.credential)
         eq_(self.api.token, credential.credential)
 
-        self.api.log.info('Test 401 on get refreshes bearer token ok!')
+        # By default, the access token's 'expiresIn' value is -1,
+        # indicating that the token will never expire.
+        #
+        # To reflect this fact, credential.expires is set to None.
+        eq_(None, credential.expires)
+
+        # But a token may specify a specific expiration time,
+        # which is used to set a future value for credential.expires.
+        self.api.access_token_response = self.api.mock_access_token_response(
+            "new bearer token 2", 1000
+        )
+        self.api.refresh_creds(credential)
+        eq_("new bearer token 2", credential.credential)
+        eq_(self.api.token, credential.credential)
+        assert credential.expires > datetime.datetime.now()
+
+    def test_credential_refresh_failure(self):
+        """Verify that a useful error message results when the Odilo bearer
+        token cannot be refreshed, since this is the most likely point
+        of failure on a new setup.
+        """
+        self.api.access_token_response = MockRequestsResponse(
+            200, {"Content-Type": "text/html"},
+            "Hi, this is the website, not the API."
+        )
+        credential = self.api.credential_object(lambda x: x)
+        assert_raises_regexp(
+            BadResponseException,
+            "Bad response from .*: .* may not be the right base URL. Response document was: 'Hi, this is the website, not the API.'",
+            self.api.refresh_creds,
+            credential
+        )
+
+        # Also test a 400 response code.
+        self.api.access_token_response = MockRequestsResponse(
+            400, {"Content-Type": "application/json"},
+
+            json.dumps(dict(errors=[dict(description="Oops")]))
+        )
+        assert_raises_regexp(
+            BadResponseException, "Bad response from .*: Oops",
+            self.api.refresh_creds,
+            credential
+        )
+
+        # If there's a 400 response but no error information,
+        # the generic error message is used.
+        self.api.access_token_response = MockRequestsResponse(
+            400, {"Content-Type": "application/json"},
+
+            json.dumps(dict())
+        )
+        assert_raises_regexp(
+            BadResponseException, "Bad response from .*: .* may not be the right base URL.",
+            self.api.refresh_creds,
+            credential
+        )
+
 
     def test_401_after_token_refresh_raises_error(self):
         eq_("bearer token", self.api.token)
@@ -276,3 +339,14 @@ class TestOdiloRepresentationExtractor(OdiloTestWithAPI):
         eq_(1, circulation.licenses_reserved)
 
         self.api.log.info('Testing book info with metadata finished ok !!')
+
+    def test_default_language_spanish(self):
+        """Since Odilo primarily distributes Spanish-language titles, if a
+        title comes in with no specified language, we assume it's
+        Spanish.
+        """
+        raw, book_json = self.sample_json("odilo_metadata.json")
+        raw, availability = self.sample_json("odilo_availability.json")
+        del book_json['language']
+        metadata, active = OdiloRepresentationExtractor.record_info_to_metadata(book_json, availability)
+        eq_('spa', metadata.language)

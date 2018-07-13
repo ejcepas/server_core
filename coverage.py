@@ -24,6 +24,7 @@ from model import (
 from metadata_layer import (
     ReplacementPolicy
 )
+from util.worker_pools import DatabaseJob
 
 import log # This sets the appropriate log format.
 
@@ -102,7 +103,7 @@ class BaseCoverageProvider(object):
 
     # In your subclass, you _may_ set this to a string that distinguishes
     # two different CoverageProviders from the same data source.
-    # (You may also override the get_operation() method, if you need 
+    # (You may also override the operation method, if you need
     # database access to determine which operation to use.)
     OPERATION = None
     
@@ -113,15 +114,22 @@ class BaseCoverageProvider(object):
     # `batch_size` in the constructor, but generally nobody bothers
     # doing this.
     DEFAULT_BATCH_SIZE = 100
-    
-    def __init__(self, _db, batch_size=None, cutoff_time=None):
+
+    def __init__(self, _db, batch_size=None, cutoff_time=None,
+        registered_only=False,
+    ):
         """Constructor.
 
-        :batch_size: The maximum number of objects that will be processed
+        :param batch_size: The maximum number of objects that will be processed
         at once.
 
         :param cutoff_time: Coverage records created before this time
         will be treated as though they did not exist.
+
+        :param registered_only: Optional. Determines whether this
+        CoverageProvider will only cover items that already have been
+        "preregistered" with a CoverageRecord with a registered or failing
+        status. This option is only used on the Metadata Wrangler.
         """
         self._db = _db
         if not self.__class__.SERVICE_NAME:
@@ -129,17 +137,17 @@ class BaseCoverageProvider(object):
                 "%s must define SERVICE_NAME." % self.__class__.__name__
             )
         service_name = self.__class__.SERVICE_NAME
-        self.operation = self.get_operation()
-        
-        if self.operation:
-            service_name += ' (%s)' % self.operation
+        operation = self.operation
+        if operation:
+            service_name += ' (%s)' % operation
         self.service_name = service_name
         if not batch_size or batch_size < 0:
             batch_size = self.DEFAULT_BATCH_SIZE
         self.batch_size = batch_size
         self.cutoff_time = cutoff_time
+        self.registered_only = registered_only
         self.collection_id = None
-        
+
     @property
     def log(self):
         if not hasattr(self, '_log'):
@@ -155,7 +163,8 @@ class BaseCoverageProvider(object):
             return None
         return get_one(self._db, Collection, id=self.collection_id)
 
-    def get_operation(self):
+    @property
+    def operation(self):
         """Which operation should this CoverageProvider use to
         distinguish between multiple CoverageRecords from the same data
         source?
@@ -166,23 +175,23 @@ class BaseCoverageProvider(object):
         self.run_once_and_update_timestamp()
 
     def run_once_and_update_timestamp(self):
-        # First cover items that have never had a coverage attempt
-        # before.
-        offset = 0
-        while offset is not None:
-            offset = self.run_once(
-                offset, count_as_covered=BaseCoverageRecord.ALL_STATUSES
-            )
+        # First prioritize items that have never had a coverage attempt before.
+        # Then cover items that failed with a transient failure on a
+        # previous attempt.
+        covered_status_lists = [
+            BaseCoverageRecord.PREVIOUSLY_ATTEMPTED,
+            BaseCoverageRecord.DEFAULT_COUNT_AS_COVERED
+        ]
+        for covered_statuses in covered_status_lists:
+            offset = 0
+            while offset is not None:
+                offset = self.run_once(
+                    offset, count_as_covered=covered_statuses
+                )
 
-        # Next, cover items that failed with a transient failure
-        # on a previous attempt.
-        offset = 0
-        while offset is not None:
-            offset = self.run_once(
-                offset, 
-                count_as_covered=BaseCoverageRecord.DEFAULT_COUNT_AS_COVERED
-            )
-        
+        self.update_timestamp()
+
+    def update_timestamp(self):
         Timestamp.stamp(self._db, self.service_name, self.collection)
         self._db.commit()
 
@@ -190,10 +199,10 @@ class BaseCoverageProvider(object):
         count_as_covered = count_as_covered or BaseCoverageRecord.DEFAULT_COUNT_AS_COVERED
         # Make it clear which class of items we're covering on this
         # run.
-        count_as_covered_message = '(counting %s as covered)' % (', '.join(count_as_covered))
+        count_as_covered_message = ' (counting %s as covered)' % (', '.join(count_as_covered))
 
         qu = self.items_that_need_coverage(count_as_covered=count_as_covered)
-        self.log.info("%d items need coverage%s", qu.count(), 
+        self.log.info("%d items need coverage%s", qu.count(),
                       count_as_covered_message)
         batch = qu.limit(self.batch_size).offset(offset)
 
@@ -340,6 +349,11 @@ class BaseCoverageProvider(object):
             # so we need to do the work.
             return True
 
+        if coverage_record.status==BaseCoverageRecord.REGISTERED:
+            # There's a CoverageRecord, but coverage hasn't actually
+            # been attempted. Try to get covered.
+            return True
+
         if self.cutoff_time is None:
             # An easy decision -- without a cutoff_time, once we
             # create a coverage record we never update it.
@@ -441,7 +455,7 @@ class IdentifierCoverageProvider(BaseCoverageProvider):
     COVERAGE_COUNTS_FOR_EVERY_COLLECTION = True
     
     def __init__(self, _db, collection=None, input_identifiers=None,
-                 replacement_policy=None, preregistered_only=False, **kwargs
+                 replacement_policy=None, **kwargs
     ):
         """Constructor.
 
@@ -458,10 +472,6 @@ class IdentifierCoverageProvider(BaseCoverageProvider):
            Identifiers.
         :param replacement_policy: Optional. A ReplacementPolicy to use
            when updating local data with data from the third party.
-        :param preregistered_only: Optional. Determines whether this
-           CoverageProvider will only cover Identifiers that have been
-           "preregistered" with a failing CoverageRecord. This option is
-           only used on the Metadata Wrangler.
         """
         super(IdentifierCoverageProvider, self).__init__(_db, **kwargs)
 
@@ -475,7 +485,6 @@ class IdentifierCoverageProvider(BaseCoverageProvider):
         self.replacement_policy = (
             replacement_policy or self._default_replacement_policy(_db)
         )
-        self.preregistered_only = preregistered_only
 
         if not self.DATA_SOURCE_NAME:
             raise ValueError(
@@ -532,47 +541,103 @@ class IdentifierCoverageProvider(BaseCoverageProvider):
             return value
 
     @classmethod
-    def register(cls, identifier, collection=None):
-        """Registers an identifier for future coverage
+    def register(cls, identifier, data_source=None, collection=None,
+        force=False, autocreate=False
+    ):
+        """Registers an identifier for future coverage.
 
-        This method is primarily for use with CoverageProviders that use the
-        `preregistered_only` flag to process items. It's currently only in use
-        on the Metadata Wrangler.
-
-        TODO: Take identifier eligibility into account when registering.
+        See `CoverageProvider.bulk_register` for more information about using
+        this method.
         """
         name = cls.SERVICE_NAME or cls.__name__
         log = logging.getLogger(name)
+
+        new_records, ignored_identifiers = cls.bulk_register(
+            [identifier], data_source=data_source, collection=collection,
+            force=force, autocreate=autocreate
+        )
+        was_registered = identifier not in ignored_identifiers
+
+        new_record = None
+        if new_records:
+            [new_record] = new_records
+
+        if was_registered and new_record:
+            log.info('CREATED %r' % new_record)
+            return new_record, was_registered
+
         _db = Session.object_session(identifier)
+        data_source = cls._data_source_for_registration(
+            _db, data_source, autocreate=autocreate
+        )
 
-        source = DataSource.lookup(_db, cls.DATA_SOURCE_NAME)
-        if collection and not source:
-            # The registration DataSource is based on a given Collection
-            # instead of the class. This happens on the Metadata Wrangler.
-            source = collection.data_source
-        operation = cls.OPERATION
-
-        if cls.COVERAGE_COUNTS_FOR_EVERY_COLLECTION:
+        if collection and cls.COVERAGE_COUNTS_FOR_EVERY_COLLECTION:
             # There's no need for a collection when registering this
             # Identifier, even if it provided the DataSource.
             collection = None
 
-        was_registered = False
         existing_record = CoverageRecord.lookup(
-            identifier, source, operation, collection=collection
+            identifier, data_source, cls.OPERATION, collection=collection
         )
-        if existing_record:
-            log.info('FOUND %r' % existing_record)
-            return existing_record, was_registered
+        log.info('FOUND %r' % existing_record)
+        return existing_record, was_registered
 
-        was_registered = True
-        new_record, is_new = CoverageRecord.add_for(
-            identifier, source, operation=operation,
-            status=CoverageRecord.REGISTERED,
-            collection=collection
+    @classmethod
+    def bulk_register(cls, identifiers, data_source=None, collection=None,
+        force=False, autocreate=False
+    ):
+        """Registers identifiers for future coverage.
+
+        This method is primarily for use with CoverageProviders that use the
+        `registered_only` flag to process items. It's currently only in use
+        on the Metadata Wrangler.
+
+        :param data_source: DataSource object or basestring representing a
+            DataSource name.
+        :param collection: Collection object to be associated with the
+            CoverageRecords.
+        :param force: When True, even existing CoverageRecords will have
+            their status reset to CoverageRecord.REGISTERED.
+        :param autocreate: When True, a basestring provided by data_source will
+            be autocreated in the database if it didn't previously exist.
+
+        :return: A tuple of two lists: the first has fresh new REGISTERED
+            CoverageRecords and the second list already has Identifiers that
+            were ignored because they already had coverage.
+
+        TODO: Take identifier eligibility into account when registering.
+        """
+        if not identifiers:
+            return list(), list()
+
+        _db = Session.object_session(identifiers[0])
+        data_source = cls._data_source_for_registration(
+            _db, data_source, autocreate=autocreate
         )
-        log.info('CREATED %r' % new_record)
-        return new_record, was_registered
+
+        if collection and cls.COVERAGE_COUNTS_FOR_EVERY_COLLECTION:
+            # There's no need for a collection on this CoverageRecord.
+            collection = None
+
+        new_records, ignored_identifiers = CoverageRecord.bulk_add(
+            identifiers, data_source, operation=cls.OPERATION,
+            status=CoverageRecord.REGISTERED, collection=collection,
+            force=force,
+        )
+
+        return new_records, ignored_identifiers
+
+    @classmethod
+    def _data_source_for_registration(cls, _db, data_source, autocreate=False):
+        """Finds or creates a DataSource for the registration methods
+        `cls.register` and `cls.bulk_register`.
+        """
+        if not data_source:
+            return DataSource.lookup(_db, cls.DATA_SOURCE_NAME)
+        if isinstance(data_source, DataSource):
+            return data_source
+        if isinstance(data_source, basestring):
+            return DataSource.lookup(_db, data_source, autocreate=autocreate)
 
     @property
     def data_source(self):
@@ -594,6 +659,17 @@ class IdentifierCoverageProvider(BaseCoverageProvider):
             transient=transient,
             collection=self.collection_or_not,
         )
+
+    def can_cover(self, identifier):
+        """Can this IdentifierCoverageProvider do anything with the given
+        Identifier?
+
+        This is not needed in the normal course of events, but a
+        caller may need to decide whether to pass an Identifier
+        into ensure_coverage() or register().
+        """
+        return (not self.input_identifier_types
+                or identifier.type in self.input_identifier_types)
     
     def run_on_specific_identifiers(self, identifiers):
         """Split a specific set of Identifiers into batches and process one
@@ -654,9 +730,20 @@ class IdentifierCoverageProvider(BaseCoverageProvider):
             identifier = item
         else:
             identifier = item.primary_identifier
+
+        if self.COVERAGE_COUNTS_FOR_EVERY_COLLECTION:
+            # We need to cover this Identifier once, and then we're
+            # done, for all collections.
+            collection = None
+        else:
+            # We need separate coverage for the specific Collection
+            # associated with this CoverageProvider.
+            collection = self.collection
+
         coverage_record = get_one(
             self._db, CoverageRecord,
             identifier=identifier,
+            collection=collection,
             data_source=self.data_source,
             operation=self.operation,
             on_multiple='interchangeable',
@@ -744,11 +831,15 @@ class IdentifierCoverageProvider(BaseCoverageProvider):
             identifiers=self.input_identifiers, collection=self.collection_or_not,
             **kwargs
         )
+
         if identifiers:
             qu = qu.filter(Identifier.id.in_([x.id for x in identifiers]))
+        if not identifiers and identifiers != None:
+            # An empty list was provided. The returned query should be empty.
+            qu = qu.filter(Identifier.id==None)
 
-        if self.preregistered_only:
-            # Return Identifiers that have been "preregistered" for coverage
+        if self.registered_only:
+            # Return Identifiers that have been "registered" for coverage
             # or already have a failure from previous coverage attempts.
             qu = qu.filter(CoverageRecord.id != None)
 
@@ -857,6 +948,17 @@ class CollectionCoverageProvider(IdentifierCoverageProvider):
         return ReplacementPolicy.from_license_source(_db)
 
     @classmethod
+    def collections(cls, _db):
+        """Returns a list of randomly sorted list of collections covered by the
+        provider.
+        """
+        if cls.PROTOCOL:
+            collections = Collection.by_protocol(_db, cls.PROTOCOL)
+        else:
+            collections = _db.query(Collection)
+        return collections.order_by(func.random()).all()
+
+    @classmethod
     def all(cls, _db, **kwargs):
         """Yield a sequence of CollectionCoverageProvider instances, one for
         every Collection that gets its licenses from cls.PROTOCOL.
@@ -867,14 +969,14 @@ class CollectionCoverageProvider(IdentifierCoverageProvider):
         CollectionCoverageProvider (or, more likely, one of its subclasses).
 
         """
-        if cls.PROTOCOL:
-            collections = Collection.by_protocol(_db, cls.PROTOCOL)
-        else:
-            collections = _db.query(Collection)
-
-        collections = collections.order_by(func.random())
-        for collection in collections:
+        for collection in cls.collections(_db):
             yield cls(collection, **kwargs)
+
+    def run_once(self, *args, **kwargs):
+        self.log.info("Considering collection %s", self.collection.name)
+        return super(CollectionCoverageProvider, self).run_once(
+            *args, **kwargs
+        )
 
     def items_that_need_coverage(self, identifiers=None, **kwargs):
         """Find all Identifiers associated with this Collection but lacking
@@ -888,17 +990,28 @@ class CollectionCoverageProvider(IdentifierCoverageProvider):
         )
         return qu
 
-    def license_pool(self, identifier):
+    def license_pool(self, identifier, data_source=None):
         """Finds this Collection's LicensePool for the given Identifier,
         creating one if necessary.
+
+        :param data_source: If it's necessary to create a LicensePool,
+        the new LicensePool will have this DataSource. The default is to
+        use the DataSource associated with the CoverageProvider. This
+        should only be needed by the metadata wrangler.
         """
-        license_pools = [p for p in identifier.licensed_through
-                         if self.collection==p.collection]
-            
+        license_pools = [
+            p for p in identifier.licensed_through
+            if self.collection==p.collection
+        ]
+
         if license_pools:
             # A given Collection may have at most one LicensePool for
             # a given identifier.
             return license_pools[0]
+
+        data_source = data_source or self.data_source
+        if isinstance(data_source, basestring):
+            data_source = DataSource.lookup(self._db, data_source)
 
         # This Collection has no LicensePool for the given Identifier.
         # Create one.
@@ -911,12 +1024,12 @@ class CollectionCoverageProvider(IdentifierCoverageProvider):
         # which typically has to manage information about books it has no
         # rights to.
         license_pool, ignore = LicensePool.for_foreign_id(
-            self._db, self.data_source, identifier.type, 
+            self._db, data_source, identifier.type,
             identifier.identifier, collection=self.collection
         )
         return license_pool
 
-    def work(self, identifier):
+    def work(self, identifier, license_pool=None, **calculate_work_kwargs):
         """Finds or creates a Work for this Identifier as licensed through
         this Collection.
 
@@ -926,8 +1039,9 @@ class CollectionCoverageProvider(IdentifierCoverageProvider):
         
         However, if there is no current Work, a Work will only be
         created if the given Identifier already has a LicensePool in
-        the Collection associated with this CoverageProvider. This method
-        will not create new LicensePools.
+        the Collection associated with this CoverageProvider (or if a
+        LicensePool to use is provided.) This method will not create
+        new LicensePools.
 
         :return: A Work, if possible. Otherwise, a CoverageFailure explaining
         why no Work could be created.
@@ -943,16 +1057,22 @@ class CollectionCoverageProvider(IdentifierCoverageProvider):
         # a LicensePool, beyond this point the CoverageProvider
         # needs to have a Collection associated with it.
         error = None
-        pool = None
-        pool, ignore = LicensePool.for_foreign_id(
-            self._db, self.data_source, identifier.type, 
-            identifier.identifier, collection=self.collection,
-            autocreate=False
-        )
+        if not license_pool:
+            license_pool, ignore = LicensePool.for_foreign_id(
+                self._db, self.data_source, identifier.type,
+                identifier.identifier, collection=self.collection,
+                autocreate=False
+            )
             
-        if pool:
-            work, created = pool.calculate_work(
-                even_if_no_author=True, exclude_search=self.EXCLUDE_SEARCH_INDEX
+        if license_pool:
+            for (v, default) in (
+                ('even_if_no_author', True),
+                ('exclude_search', self.EXCLUDE_SEARCH_INDEX)
+            ):
+                if not v in calculate_work_kwargs:
+                    calculate_work_kwargs[v] = default
+            work, created = license_pool.calculate_work(
+                **calculate_work_kwargs
             )
             if not work:
                 error = "Work could not be calculated"
@@ -1041,6 +1161,22 @@ class CollectionCoverageProvider(IdentifierCoverageProvider):
         return identifier
 
 
+class CollectionCoverageProviderJob(DatabaseJob):
+
+    def __init__(self, collection, provider_class, item_offset,
+        **provider_kwargs
+    ):
+        self.collection = collection
+        self.offset = item_offset
+        self.provider_class = provider_class
+        self.provider_kwargs = provider_kwargs
+
+    def run(self, _db, **kwargs):
+        collection = _db.merge(self.collection)
+        provider = self.provider_class(collection, **self.provider_kwargs)
+        provider.run_once(self.offset)
+
+
 class CatalogCoverageProvider(CollectionCoverageProvider):
     """Most CollectionCoverageProviders provide coverage to Identifiers
     that are licensed through a given Collection.
@@ -1086,7 +1222,32 @@ class BibliographicCoverageProvider(CollectionCoverageProvider):
 class WorkCoverageProvider(BaseCoverageProvider):
 
     """Perform coverage operations on Works rather than Identifiers."""
-    
+
+    @classmethod
+    def register(cls, work, force=False):
+        """Registers a work for future coverage.
+
+        This method is primarily for use with CoverageProviders that use the
+        `registered_only` flag to process items. It's currently only in use
+        on the Metadata Wrangler.
+
+        :param force: Set to True to reset an existing CoverageRecord's status
+        "registered", regardless of its current status.
+        """
+        was_registered = True
+        if not force:
+            record = WorkCoverageRecord.lookup(work, cls.OPERATION)
+            if record:
+                was_registered = False
+                return record, was_registered
+
+        # WorkCoverageRecord.add_for overwrites the status already,
+        # so it can be used to create and to force-register records.
+        record, is_new = WorkCoverageRecord.add_for(
+            work, cls.OPERATION, status=CoverageRecord.REGISTERED
+        )
+        return record, was_registered
+
     #
     # Implementation of BaseCoverageProvider virtual methods.
     #
@@ -1101,7 +1262,7 @@ class WorkCoverageProvider(BaseCoverageProvider):
         are chosen.
         """
         qu = Work.missing_coverage_from(
-            self._db, operation=self.operation, 
+            self._db, operation=self.operation,
             count_as_missing_before=self.cutoff_time,
             **kwargs
         )
@@ -1110,6 +1271,12 @@ class WorkCoverageProvider(BaseCoverageProvider):
             qu = qu.join(Work.license_pools).filter(
                 LicensePool.identifier_id.in_(ids)
             )
+
+        if self.registered_only:
+            # Return Identifiers that have been "registered" for coverage
+            # or already have a failure from previous coverage attempts.
+            qu = qu.filter(WorkCoverageRecord.id != None)
+
         return qu
 
     def failure(self, work, error, transient=True):
@@ -1146,3 +1313,35 @@ class WorkCoverageProvider(BaseCoverageProvider):
     def record_failure_as_coverage_record(self, failure):
         """Turn a CoverageFailure into a WorkCoverageRecord object."""
         return failure.to_work_coverage_record(operation=self.operation)
+
+
+class PresentationReadyWorkCoverageProvider(WorkCoverageProvider):
+    """A WorkCoverageProvider that only covers presentation-ready works.
+    """
+    def items_that_need_coverage(self, identifiers=None, **kwargs):
+        qu = super(PresentationReadyWorkCoverageProvider, self).items_that_need_coverage(
+            identifiers, **kwargs
+)
+        qu = qu.filter(Work.presentation_ready==True)
+        return qu
+
+
+class OPDSEntryWorkCoverageProvider(PresentationReadyWorkCoverageProvider):
+    """Make sure all presentation-ready works have an up-to-date OPDS
+    entry.
+
+    Normally this coverage is provided by the process of making a work
+    presentation-ready, but a migration script may strip that coverage
+    if it knows a work will need to have its OPDS entry recalculated.
+
+    This is different from the OPDSEntryCacheMonitor, which sweeps
+    over all presentation-ready works, even ones which are already
+    covered.
+    """
+
+    SERVICE_NAME = "OPDS Entry Work Coverage Provider"
+    OPERATION = WorkCoverageRecord.GENERATE_OPDS_OPERATION
+
+    def process_item(self, work):
+        work.calculate_opds_entries()
+        return work

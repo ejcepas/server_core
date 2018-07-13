@@ -19,8 +19,14 @@ from sqlalchemy.orm import aliased
 import csv
 import datetime
 import logging
+import re
+
+from pymarc import MARCReader
+
 from util import LanguageCodes
+from util.personal_names import name_tidy
 from util.median import median
+from classifier import Classifier
 from model import (
     get_one,
     get_one_or_create,
@@ -40,10 +46,12 @@ from model import (
     PresentationCalculationPolicy,
     RightsStatus,
     Representation,
+    Resource,
     Work,
 )
 from classifier import NO_VALUE, NO_NUMBER
 from analytics import Analytics
+from util.personal_names import display_name_to_sort_name
 
 class ReplacementPolicy(object):
     """How serious should we be about overwriting old metadata with
@@ -217,7 +225,7 @@ class ContributorData(object):
         :return: the possibly changed Contributor object and a flag of whether it's been changed.
         """
         log = logging.getLogger("Abstract metadata layer")
-        log.debug(u"Applying %r (%s) into %r (%s)", self, self.viaf, destination, destination.viaf)
+        log.debug("Applying %r (%s) into %r (%s)", self, self.viaf, destination, destination.viaf)
 
         made_changes = False
 
@@ -290,7 +298,9 @@ class ContributorData(object):
 
         # Is there a contributor already in the database with this
         # exact sort name? If so, use their display name.
-        sort_name = self.display_name_to_sort_name(_db, self.display_name)
+        # If not, take our best guess based on the display name.
+        sort_name = self.display_name_to_sort_name_from_existing_contributor(
+            _db, self.display_name)
         if sort_name:
             self.sort_name = sort_name
             return True
@@ -301,11 +311,18 @@ class ContributorData(object):
             sort_name = self.display_name_to_sort_name_through_canonicalizer(
                 _db, identifiers, metadata_client
             )
-            self.sort_name = sort_name
+            if sort_name:
+                self.sort_name = sort_name
+                return True
+
+        # If there's still no sort name, take our best guess based
+        # on the display name.
+        self.sort_name = display_name_to_sort_name(self.display_name)
+
         return (self.sort_name is not None)
 
     @classmethod
-    def display_name_to_sort_name(self, _db, display_name):
+    def display_name_to_sort_name_from_existing_contributor(self, _db, display_name):
         """Find the sort name for this book's author, assuming it's easy.
 
         'Easy' means we already have an established sort name for a
@@ -395,7 +412,8 @@ class IdentifierData(object):
 
 class LinkData(object):
     def __init__(self, rel, href=None, media_type=None, content=None,
-                 thumbnail=None, rights_uri=None):
+                 thumbnail=None, rights_uri=None, rights_explanation=None,
+                 original=None, transformation_settings=None):
         if not rel:
             raise ValueError("rel is required")
 
@@ -407,8 +425,13 @@ class LinkData(object):
         self.content = content
         self.thumbnail = thumbnail
         # This handles content sources like unglue.it that have rights for each link
-        # rather than each edition.
+        # rather than each edition, and rights for cover images.
         self.rights_uri = rights_uri
+        self.rights_explanation = rights_explanation
+        # If this LinkData is a derivative, it may also contain the original link
+        # and the settings used to transform the original into the derivative.
+        self.original = original
+        self.transformation_settings = transformation_settings or {}
 
     @property
     def guessed_media_type(self):
@@ -484,6 +507,8 @@ class MetaToModelUtility(object):
     Contains functionality common to both CirculationData and Metadata.
     """
 
+    log = logging.getLogger("Abstract metadata layer - mirror code")
+
     def mirror_link(self, model_object, data_source, link, link_obj, policy):
         """Retrieve a copy of the given link and make sure it gets
         mirrored. If it's a full-size image, create a thumbnail and
@@ -508,7 +533,7 @@ class MetaToModelUtility(object):
                 )
             )
             return
-            
+
         mirror = policy.mirror
         http_get = policy.http_get
 
@@ -534,7 +559,7 @@ class MetaToModelUtility(object):
         if edition and edition.title:
             title = edition.title
         else:
-            title = self.title or None
+            title = getattr(self, 'title', None) or None
 
         if ((not identifier) or (link_obj.identifier and identifier != link_obj.identifier)):
             # insanity found
@@ -593,33 +618,43 @@ class MetaToModelUtility(object):
             policy.content_modifier(representation)
 
         # The metadata may have some idea about the media type for this
-        # LinkObject, but the media type we actually just saw takes 
-        # precedence.
-        if representation.media_type:
+        # LinkObject, but it could be wrong. If the representation we
+        # actually just saw is a mirrorable media type, that takes
+        # precedence. If we were expecting this link to be mirrorable
+        # but we actually saw something that's not, assume our original
+        # metadata was right and the server told us the wrong media type.
+        if representation.media_type and representation.mirrorable_media_type:
             link.media_type = representation.media_type
 
         if not representation.mirrorable_media_type:
-            self.log.info("Not mirroring %s: unsupported media type %s",
-                          representation.url, representation.media_type)
-            return
+            if link.media_type:
+                self.log.info("Saw unsupported media type for %s: %s. Assuming original media type %s is correct",
+                              representation.url, representation.media_type, link.media_type)
+                representation.media_type = link.media_type
+            else:
+                self.log.info("Not mirroring %s: unsupported media type %s",
+                              representation.url, representation.media_type)
+                return
 
         # Determine the best URL to use when mirroring this
         # representation.
-        if title and link.rel == Hyperlink.OPEN_ACCESS_DOWNLOAD:
+        if link.rel == Hyperlink.OPEN_ACCESS_DOWNLOAD:
+            url_title = title or identifier.identifier
             extension = representation.extension()
             mirror_url = mirror.book_url(
-                identifier, data_source=data_source, title=title,
+                identifier, data_source=data_source, title=url_title,
                 extension=extension
             )
         else:
-            filename = representation.default_filename(link_obj)
+            filename = representation.default_filename(
+                link_obj, representation.media_type
+            )
             mirror_url = mirror.cover_image_url(
                 data_source, identifier, filename
             )
 
         # Mirror it.
-        representation.mirror_url = mirror_url
-        mirror.mirror_one(representation)
+        mirror.mirror_one(representation, mirror_url)
 
         # If we couldn't mirror an open access link representation, suppress
         # the license pool until someone fixes it manually.
@@ -649,12 +684,12 @@ class MetaToModelUtility(object):
             if is_new:
                 # A thumbnail was created distinct from the original
                 # image. Mirror it as well.
-                mirror.mirror_one(thumbnail)
+                mirror.mirror_one(thumbnail, thumbnail_url)
 
         if link_obj.rel == Hyperlink.OPEN_ACCESS_DOWNLOAD:
-            # If we mirrored book content successfully, don't keep it in
+            # If we mirrored book content successfully, remove it from
             # the database to save space. We do keep images in case we
-            # ever need to resize them.
+            # ever need to resize them or mirror them elsewhere.
             if representation.mirrored_at and not representation.mirror_exception:
                 representation.content = None
 
@@ -705,6 +740,9 @@ class CirculationData(MetaToModelUtility):
             self.data_source_name = data_source
         if isinstance(primary_identifier, Identifier):
             self.primary_identifier_obj = primary_identifier
+            self._primary_identifier = IdentifierData(
+                primary_identifier.type, primary_identifier.identifier
+            )
         else:
             self.primary_identifier_obj = None
             self._primary_identifier = primary_identifier
@@ -844,10 +882,10 @@ class CirculationData(MetaToModelUtility):
             raise ValueError(
                 "Cannot find license pool: CirculationData has no primary identifier."
             )
-        
-        data_source = self.data_source(_db)
+
+        data_source_obj = self.data_source(_db)
         license_pool, is_new = LicensePool.for_foreign_id(
-            _db, data_source=self.data_source_obj,
+            _db, data_source=data_source_obj,
             foreign_id_type=identifier.type, 
             foreign_id=identifier.identifier,
             collection=collection
@@ -1208,7 +1246,7 @@ class Metadata(MetaToModelUtility):
         fields = self.BASIC_EDITION_FIELDS
         for field in fields:
             new_value = getattr(metadata, field)
-            if new_value:
+            if new_value != None and new_value != '':
                 setattr(self, field, new_value)
 
         new_value = getattr(metadata, 'contributors')
@@ -1442,7 +1480,7 @@ class Metadata(MetaToModelUtility):
         for field in fields:
             old_edition_value = getattr(edition, field)
             new_metadata_value = getattr(self, field)
-            if new_metadata_value and (new_metadata_value != old_edition_value):
+            if new_metadata_value != None and new_metadata_value != '' and (new_metadata_value != old_edition_value):
                 if new_metadata_value in [NO_VALUE, NO_NUMBER]:
                     new_metadata_value = None
                 setattr(edition, field, new_metadata_value)
@@ -1527,10 +1565,28 @@ class Metadata(MetaToModelUtility):
 
         for link in self.links:
             if link.rel in Hyperlink.METADATA_ALLOWED:
+                original_resource = None
+                if link.original:
+                    rights_status = RightsStatus.lookup(_db, link.original.rights_uri)
+                    original_resource, ignore = get_one_or_create(
+                        _db, Resource, url=link.original.href,
+                    )
+                    if not original_resource.data_source:
+                        original_resource.data_source = data_source
+                    original_resource.rights_status = rights_status
+                    original_resource.rights_explanation = link.original.rights_explanation
+                    if link.original.content:
+                        original_resource.set_fetched_content(
+                            link.original.guessed_media_type,
+                            link.original.content, None)
+
                 link_obj, ignore = identifier.add_link(
                     rel=link.rel, href=link.href, data_source=data_source, 
                     media_type=link.guessed_media_type,
-                    content=link.content
+                    content=link.content, rights_status_uri=link.rights_uri,
+                    rights_explanation=link.rights_explanation,
+                    original_resource=original_resource,
+                    transformation_settings=link.transformation_settings,
                 )
             link_objects[link] = link_obj
             if link.thumbnail:
@@ -1568,13 +1624,6 @@ class Metadata(MetaToModelUtility):
                 measurement.value, measurement.weight,
                 measurement.taken_at
             )
-
-        # Make sure the work we just did shows up.
-        made_changes = edition.calculate_presentation(
-            policy=replace.presentation_calculation_policy
-        )
-        if made_changes:
-            made_core_changes = True
 
         if not edition.sort_author:
             # This may be a situation like the NYT best-seller list where
@@ -1618,6 +1667,14 @@ class Metadata(MetaToModelUtility):
                 # to make sure that its thumbnail exists locally and
                 # is associated with the original image.
                 self.make_thumbnail(data_source, link, link_obj)
+
+        # Make sure the work we just did shows up. This needs to happen after mirroring
+        # so mirror urls are available.
+        made_changes = edition.calculate_presentation(
+            policy=replace.presentation_calculation_policy
+        )
+        if made_changes:
+            made_core_changes = True
 
         # The metadata wrangler doesn't need information from these data sources.
         # We don't need to send it information it originally provided, and
@@ -1986,3 +2043,105 @@ class CSVMetadataImporter(object):
                 self.log.warn('Could not parse date "%s"' % value)
                 value = None
         return value
+
+
+class MARCExtractor(object):
+
+    """Transform a MARC file into a list of Metadata objects.
+
+    This is not totally general, but it's a good start.
+    """
+
+    # Common things found in a MARC record after the name of the author
+    # which we sould like to remove.
+    END_OF_AUTHOR_NAME_RES = [
+        re.compile(",\s+[0-9]+-"), # Birth year
+        re.compile(",\s+active "),
+        re.compile(",\s+graf,"),
+        re.compile(",\s+author."),
+    ]
+
+    @classmethod
+    def name_cleanup(cls, name):
+        # Turn 'Dante Alighieri,   1265-1321, author.'
+        # into 'Dante Alighieri'.
+        for regex in cls.END_OF_AUTHOR_NAME_RES:
+            match = regex.search(name)
+            if match:
+                name = name[:match.start()]
+                break
+        name = name_tidy(name)
+        return name
+
+    @classmethod
+    def parse_year(self, value):
+        """Handle a publication year that may not be in the right format."""
+        for format in ("%Y", "%Y."):
+            try:
+                return datetime.datetime.strptime(value, format)
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def parse(cls, file, data_source_name):
+        reader = MARCReader(file)
+        metadata_records = []
+
+        for record in reader:
+            title = record.title()
+            if title.endswith(' /'):
+                title = title[:-len(' /')]
+            issued_year = cls.parse_year(record.pubyear())
+            publisher = record.publisher()
+            if publisher.endswith(','):
+                publisher = publisher[:-1]
+
+            links = []
+            summary = record.notes()[0]['a']
+
+            if summary:
+                summary_link = LinkData(
+                    rel=Hyperlink.DESCRIPTION,
+                    media_type=Representation.TEXT_PLAIN,
+                    content=summary,
+                )
+                links.append(summary_link)
+
+            isbn = record['020']['a'].split(" ")[0]
+            primary_identifier = IdentifierData(
+                Identifier.ISBN, isbn
+            )
+
+            subjects = [SubjectData(
+                Classifier.FAST,
+                subject['a'],
+            ) for subject in record.subjects()]
+
+            author = record.author()
+            if author:
+                author = cls.name_cleanup(author)
+                author_names = [author]
+            else:
+                author_names = ['Anonymous']
+            contributors = [
+                ContributorData(
+                    sort_name=author,
+                    roles=[Contributor.AUTHOR_ROLE],
+                )
+                for author in author_names
+            ]
+
+            metadata_records.append(Metadata(
+                data_source=data_source_name,
+                title=title,
+                language='eng',
+                medium=Edition.BOOK_MEDIUM,
+                publisher=publisher,
+                issued=issued_year,
+                primary_identifier=primary_identifier,
+                subjects=subjects,
+                contributors=contributors,
+                links=links
+            ))
+        return metadata_records

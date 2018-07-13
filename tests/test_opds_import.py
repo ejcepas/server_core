@@ -19,22 +19,27 @@ from . import (
     DatabaseTest,
 )
 
-from config import CannotLoadConfiguration
+from config import (
+    CannotLoadConfiguration,
+    IntegrationException,
+)
 from opds_import import (
     AccessNotAuthenticated,
     MetadataWranglerOPDSLookup,
     OPDSImporter,
-    OPDSImporterWithS3Mirror,
     OPDSImportMonitor,
     OPDSXMLParser,
     SimplifiedOPDSLookup,
 )
 from util.opds_writer import (
     AtomFeed,
+    OPDSFeed,
     OPDSMessage,
 )
 from metadata_layer import (
-    LinkData
+    LinkData,
+    CirculationData,
+    Metadata,
 )
 from model import (
     Collection,
@@ -54,8 +59,12 @@ from model import (
 )
 from coverage import CoverageFailure
 
-from s3 import DummyS3Uploader
+from s3 import (
+    S3Uploader,
+    MockS3Uploader,
+)
 from testing import DummyHTTPClient
+from util.http import BadResponseException
 
 
 class DoomedOPDSImporter(OPDSImporter):
@@ -198,6 +207,17 @@ class OPDSImporterTest(DatabaseTest):
 
 class TestOPDSImporter(OPDSImporterTest):
 
+    def test_constructor(self):
+        # The default way of making HTTP requests is with
+        # Representation.cautious_http_get.
+        importer = OPDSImporter(self._db, collection=None)
+        eq_(Representation.cautious_http_get, importer.http_get)
+
+        # But you can pass in anything you want.
+        do_get = object()
+        importer = OPDSImporter(self._db, collection=None, http_get=do_get)
+        eq_(do_get, importer.http_get)
+
     def test_data_source_autocreated(self):
         name = "New data source " + self._str
         importer = OPDSImporter(
@@ -240,6 +260,19 @@ class TestOPDSImporter(OPDSImporterTest):
         eq_("urn:librarysimplified.org/terms/id/Gutenberg%20ID/10557", identifier2)
         eq_(datetime.datetime(2015, 1, 2, 16, 56, 40), updated2)
 
+    def test_extract_last_update_dates_ignores_entries_with_no_update(self):
+        importer = OPDSImporter(
+            self._db, collection=None, data_source_name=DataSource.NYT
+        )
+
+        # Rename the <updated> and <published> tags in the content
+        # server so they don't show up.
+        content = self.content_server_mini_feed.replace("updated>", "irrelevant>")
+        content = content.replace("published>", "irrelevant>")
+        last_update_dates = importer.extract_last_update_dates(content)
+
+        # No updated dates!
+        eq_([], last_update_dates)
 
     def test_extract_metadata(self):
         data_source_name = "Data source name " + self._str
@@ -1140,11 +1173,10 @@ class TestOPDSImporter(OPDSImporterTest):
         expected = { isbn1 : lp.identifier }
         eq_(expected, importer.identifier_mapping)
 
-        # If we already have one, it isn't overwritten.
+        # If we already have one, it's overwritten.
         importer.build_identifier_mapping([isbn2.urn])
         overwrite = { isbn2 : lp.identifier }
-        eq_(False, importer.identifier_mapping==overwrite)
-        eq_(expected, importer.identifier_mapping)
+        eq_(importer.identifier_mapping, overwrite)
 
         # If the importer doesn't have a collection, we can't build
         # its mapping.
@@ -1170,7 +1202,178 @@ class TestOPDSImporter(OPDSImporterTest):
         # Both LicensePools are associated with that work.
         eq_(lp.work, work)
         eq_(lp2.work, work)
+
+    def test_assert_importable_content(self):
+
+        class Mock(OPDSImporter):
+            """An importer that may or may not be able to find
+            real open-access content.
+            """
+            # Set this variable to control whether any open-access links
+            # are "found" in the OPDS feed.
+            open_access_links = None
+
+            extract_feed_data_called_with = None
+            _is_open_access_link_called_with = []
+
+            def extract_feed_data(self, feed, feed_url):
+                # There's no need to return realistic metadata,
+                # since _open_access_links is also mocked.
+                self.extract_feed_data_called_with = (feed, feed_url)
+                return {"some": "metadata"}, {}
+
+            def _open_access_links(self, metadatas):
+                self._open_access_links_called_with = metadatas
+                for i in self.open_access_links:
+                    yield i
+
+            def _is_open_access_link(self, url, type):
+                self._is_open_access_link_called_with.append((url, type))
+                return False
+
+        class NoLinks(Mock):
+            "Simulate an OPDS feed that contains no open-access links."
+            open_access_links = []
+
+        # We don't be making any HTTP requests, even simulated ones.
+        do_get = object()
+
+        # Here, there are no links at all.
+        importer = NoLinks(self._db, None, do_get)
+        assert_raises_regexp(
+            IntegrationException,
+            "No open-access links were found in the OPDS feed.",
+            importer.assert_importable_content, "feed", "url"
+        )
+
+        # We extracted 'metadata' from the feed and URL.
+        eq_(("feed", "url"), importer.extract_feed_data_called_with)
+
+        # But there were no open-access links in the 'metadata',
+        # so we had nothing to check.
+        eq_([], importer._is_open_access_link_called_with)
+
+        oa = Hyperlink.OPEN_ACCESS_DOWNLOAD
+        class BadLinks(Mock):
+            """Simulate an OPDS feed that contains open-access links that
+            don't actually work, because _is_open_access always returns False
+            """
+            open_access_links = [
+                LinkData(href="url1", rel=oa, media_type="text/html"),
+                LinkData(href="url2", rel=oa, media_type="application/json"),
+                LinkData(href="I won't be tested", rel=oa,
+                         media_type="application/json")
+            ]
+
+        importer = BadLinks(self._db, None, do_get)
+        assert_raises_regexp(
+            IntegrationException,
+            "Was unable to GET supposedly open-access content such as url2 \(tried 2 times\)",
+            importer.assert_importable_content, "feed", "url",
+            max_get_attempts=2
+        )
         
+        # We called _is_open_access_link on the first and second links
+        # found in the 'metadata', but failed both times.
+        #
+        # We didn't bother with the third link because max_get_attempts was
+        # set to 2.
+        try1, try2 = importer._is_open_access_link_called_with
+        eq_(("url1", "text/html"), try1)
+        eq_(("url2", "application/json"), try2)
+
+        class GoodLink(Mock):
+            """Simulate an OPDS feed that contains two bad open-access links
+            and one good one.
+            """
+            _is_open_access_link_called_with = []
+            open_access_links = [
+                LinkData(href="bad", rel=oa, media_type="text/html"),
+                LinkData(href="good", rel=oa, media_type="application/json"),
+                LinkData(href="also bad", rel=oa, media_type="text/html"),
+            ]
+            def _is_open_access_link(self, url, type):
+                self._is_open_access_link_called_with.append((url, type))
+                if url == 'bad':
+                    return False
+                return "this is a book"
+        importer = GoodLink(self._db, None, do_get)
+        result = importer.assert_importable_content(
+            "feed", "url", max_get_attempts=5
+        )
+        eq_("this is a book", result)
+
+        # The first link didn't work, but the second one did,
+        # so we didn't try the third one.
+        try1, try2 = importer._is_open_access_link_called_with
+        eq_(("bad", "text/html"), try1)
+        eq_(("good", "application/json"), try2)
+
+    def test__open_access_links(self):
+        """Test our ability to find open-access links in Metadata objects."""
+        m = OPDSImporter._open_access_links
+
+        # No Metadata objects, no links.
+        eq_([], list(m([])))
+
+        # This Metadata has no associated CirculationData and will be
+        # ignored.
+        no_circulation = Metadata(DataSource.GUTENBERG)
+
+        # This CirculationData has no open-access links, so it will be
+        # ignored.
+        circulation = CirculationData(DataSource.GUTENBERG, self._identifier())
+        no_open_access_links = Metadata(
+            DataSource.GUTENBERG, circulation=circulation
+        )
+
+        # This has three links, but only the open-access links
+        # will be returned.
+        circulation = CirculationData(DataSource.GUTENBERG, self._identifier())
+        oa = Hyperlink.OPEN_ACCESS_DOWNLOAD
+        for rel in [oa, Hyperlink.IMAGE, oa]:
+            circulation.links.append(
+                LinkData(href=self._url, rel=rel)
+            )
+        two_open_access_links = Metadata(
+            DataSource.GUTENBERG, circulation=circulation
+        )
+
+        oa_only = [x for x in circulation.links if x.rel==oa]
+        eq_(oa_only, list(m([no_circulation, two_open_access_links,
+                             no_open_access_links])))
+
+    def test__is_open_access_link(self):
+        http = DummyHTTPClient()
+
+        # We only check that the response entity-body isn't tiny. 11
+        # kilobytes of data is enough.
+        enough_content = "a" * (1024*11)
+
+        # Set up an HTTP response that looks enough like a book
+        # to convince _is_open_access_link.
+        http.queue_response(200, content=enough_content)
+        monitor = OPDSImporter(self._db, None, http_get=http.do_get)
+
+        url = self._url
+        type = "text/html"
+        eq_("Found a book-like thing at %s" % url,
+            monitor._is_open_access_link(url, type))
+
+        # We made a GET request to the appropriate URL.
+        eq_(url, http.requests.pop())
+
+        # This HTTP response looks OK but it's not big enough to be
+        # any kind of book.
+        http.queue_response(200, content="not enough content")
+        monitor = OPDSImporter(self._db, None, http_get=http.do_get)
+        eq_(False, monitor._is_open_access_link(url, None))
+
+        # This HTTP response is clearly an error page.
+        http.queue_response(404, content=enough_content)
+        monitor = OPDSImporter(self._db, None, http_get=http.do_get)
+        eq_(False, monitor._is_open_access_link(url, None))
+
 
 class TestCombine(object):
     """Test that OPDSImporter.combine combines dictionaries in sensible
@@ -1274,7 +1477,31 @@ class TestCombine(object):
         eq_(dict(a=dict(b=[True, False])),
             OPDSImporter.combine(a_is_true, a_is_false))
         
-class TestOPDSImporterWithS3Mirror(OPDSImporterTest):
+class TestMirroring(OPDSImporterTest):
+
+    def test_importer_gets_appropriate_mirror_for_collection(self):
+
+        # The default collection is not configured to mirror the
+        # resources it finds.
+        collection = self._default_collection
+        importer = OPDSImporter(self._db, collection=collection)
+        eq_(None, importer.mirror)
+
+        # Let's configure a mirror integration for it.
+        integration = self._external_integration(
+            ExternalIntegration.S3, ExternalIntegration.STORAGE_GOAL,
+            username="username", password="password",
+            settings = {S3Uploader.BOOK_COVERS_BUCKET_KEY : "some-covers"}
+        )
+        collection.mirror_integration = integration
+
+        # Now an OPDSImporter created for this collection has an
+        # appropriately configured MirrorUploader associated with it.
+        importer = OPDSImporter(self._db, collection=collection)
+        mirror = importer.mirror
+        assert isinstance(mirror, S3Uploader)
+        eq_("some-covers",
+            mirror.get_bucket(S3Uploader.BOOK_COVERS_BUCKET_KEY))
 
     def test_resources_are_mirrored_on_import(self):
 
@@ -1301,7 +1528,7 @@ class TestOPDSImporterWithS3Mirror(OPDSImporterTest):
         # will result in a 404 error, and the image will not be mirrored.
         http.queue_response(404, media_type="text/plain")
 
-        s3 = DummyS3Uploader()
+        s3 = MockS3Uploader()
 
         importer = OPDSImporter(
             self._db, collection=self._default_collection,
@@ -1373,15 +1600,16 @@ class TestOPDSImporterWithS3Mirror(OPDSImporterTest):
         # Project Gutenberg, its data source.
         #
         # The images were mirrored to a bucket corresponding to the
-        # open-access content server, _their_ data source.
+        # open-access content server, _their_ data source. Each image
+        # has an extension befitting its media type.
         #
         # The "crow" book was mirrored to a bucket corresponding to
         # the open-access content source, the default data source used
         # when no distributor was specified for a book.
-        url0 = 'http://s3.amazonaws.com/test.content.bucket/Gutenberg/Gutenberg%20ID/10441/The%20Green%20Mouse.epub.images'
-        url1 = u'http://s3.amazonaws.com/test.cover.bucket/Library%20Simplified%20Open%20Access%20Content%20Server/Gutenberg%20ID/10441/cover_10441_9.png'
-        url2 = u'http://s3.amazonaws.com/test.cover.bucket/scaled/300/Library%20Simplified%20Open%20Access%20Content%20Server/Gutenberg%20ID/10441/cover_10441_9.png'
-        url3 = 'http://s3.amazonaws.com/test.content.bucket/Library%20Simplified%20Open%20Access%20Content%20Server/Gutenberg%20ID/10557/Johnny%20Crow%27s%20Party.epub.images'
+        url0 = 'https://s3.amazonaws.com/test.content.bucket/Gutenberg/Gutenberg+ID/10441/The+Green+Mouse.epub.images'
+        url1 = u'https://s3.amazonaws.com/test.cover.bucket/Library+Simplified+Open+Access+Content+Server/Gutenberg+ID/10441/cover_10441_9.svg'
+        url2 = u'https://s3.amazonaws.com/test.cover.bucket/scaled/300/Library+Simplified+Open+Access+Content+Server/Gutenberg+ID/10441/cover_10441_9.png'
+        url3 = 'https://s3.amazonaws.com/test.content.bucket/Library+Simplified+Open+Access+Content+Server/Gutenberg+ID/10557/Johnny+Crow%27s+Party.epub.images'
         uploaded_urls = [x.mirror_url for x in s3.uploaded]
         eq_([url0, url1, url2, url3], uploaded_urls)
 
@@ -1461,7 +1689,7 @@ class TestOPDSImporterWithS3Mirror(OPDSImporterTest):
             200, content=svg, media_type=Representation.SVG_MEDIA_TYPE
         )
 
-        s3 = DummyS3Uploader()
+        s3 = MockS3Uploader()
 
         importer = OPDSImporter(
             self._db, collection=None,
@@ -1520,13 +1748,72 @@ class TestOPDSImportMonitor(OPDSImporterTest):
             self._default_collection,
             OPDSImporter,
         )
+
+    def test_external_integration(self):
+        monitor = OPDSImportMonitor(
+            self._db, self._default_collection,
+            import_class=OPDSImporter,
+        )
+        eq_(self._default_collection.external_integration,
+            monitor.external_integration(self._db))
+
+    def test__run_self_tests(self):
+        """Verify the self-tests of an OPDS collection."""
+
+        class MockImporter(OPDSImporter):
+            def assert_importable_content(self, content, url):
+                self.assert_importable_content_called_with = (content, url)
+                return "looks good"
+
+        class Mock(OPDSImportMonitor):
+            follow_one_link_called_with = []
+
+            # First we will get the first page of the OPDS feed.
+            def follow_one_link(self, url):
+                self.follow_one_link_called_with.append(url)
+                return (url, "some content")
+
+        feed_url = self._url
+        self._default_collection.external_account_id = feed_url
+        monitor = Mock(self._db, self._default_collection,
+                       import_class=MockImporter)
+        [first_page, found_content] = monitor._run_self_tests(self._db)
+        expect = "Retrieve the first page of the OPDS feed (%s)" % feed_url
+        eq_(expect, first_page.name)
+        eq_(True, first_page.success)
+        eq_((feed_url, "some content"), first_page.result)
+
+        # follow_one_link was called once.
+        [link] = monitor.follow_one_link_called_with
+        eq_(monitor.feed_url, link)
+
+        # Then, assert_importable_content was called on the importer.
+        eq_("Checking for importable content", found_content.name)
+        eq_(True, found_content.success)
+        eq_(("some content", feed_url),
+            monitor.importer.assert_importable_content_called_with)
+        eq_("looks good", found_content.result)
+
+    def test_hook_methods(self):
+        """By default, the OPDS URL and data source used by the importer 
+        come from the collection configuration.
+        """
+        monitor = OPDSImportMonitor(
+            self._db, self._default_collection,
+            import_class=OPDSImporter,
+        )
+        eq_(self._default_collection.external_account_id,
+            monitor.opds_url(self._default_collection))
+
+        eq_(self._default_collection.data_source,
+            monitor.data_source(self._default_collection))
         
     def test_feed_contains_new_data(self):
         feed = self.content_server_mini_feed
 
         class MockOPDSImportMonitor(OPDSImportMonitor):
             def _get(self, url, headers):
-                return 200, {}, feed
+                return 200, {"content-type": AtomFeed.ATOM_TYPE}, feed
 
         monitor = OPDSImportMonitor(
             self._db, self._default_collection,
@@ -1598,6 +1885,12 @@ class TestOPDSImportMonitor(OPDSImporterTest):
         record.timestamp = datetime.datetime(1970, 1, 1, 1, 1, 1)
         eq_(True, monitor.feed_contains_new_data(feed))
 
+    def http_with_feed(self, feed, content_type=OPDSFeed.ACQUISITION_FEED_TYPE):
+        """Helper method to make a DummyHTTPClient with a
+        successful OPDS feed response queued.
+        """
+        return http
+
     def test_follow_one_link(self):
         monitor = OPDSImportMonitor(
             self._db, collection=self._default_collection,
@@ -1605,13 +1898,12 @@ class TestOPDSImportMonitor(OPDSImporterTest):
         )
         feed = self.content_server_mini_feed
 
-        # If there's new data, follow_one_link extracts the next links.
-
         http = DummyHTTPClient()
-        http.queue_response(200, content=feed)
-
-        next_links, content = monitor.follow_one_link("http://url", do_get=http.do_get)
-        
+        # If there's new data, follow_one_link extracts the next links.
+        def follow():
+            return monitor.follow_one_link("http://url", do_get=http.do_get)
+        http.queue_response(200, OPDSFeed.ACQUISITION_FEED_TYPE, content=feed)
+        next_links, content = follow()
         eq_(1, len(next_links))
         eq_("http://localhost:5000/?after=327&size=100", next_links[0])
 
@@ -1631,14 +1923,33 @@ class TestOPDSImportMonitor(OPDSImporterTest):
             record.timestamp = datetime.datetime(2016, 1, 1, 1, 1, 1)
 
 
-        # If there's no new data, follow_one_link returns no next links and no content.
-        http.queue_response(200, content=feed)
+        # If there's no new data, follow_one_link returns no next
+        # links and no content.
+        #
+        # Note that this works even when the media type is imprecisely
+        # specified as Atom or bare XML.
+        for imprecise_media_type in OPDSFeed.ATOM_LIKE_TYPES:
+            http.queue_response(200, imprecise_media_type, content=feed)
+            next_links, content = follow()
+            eq_(0, len(next_links))
+            eq_(None, content)
 
-        next_links, content = monitor.follow_one_link("http://url", do_get=http.do_get)
-
+        http.queue_response(200, AtomFeed.ATOM_TYPE, content=feed)
+        next_links, content = follow()
         eq_(0, len(next_links))
         eq_(None, content)
 
+        # If the media type is missing or is not an Atom feed,
+        # an exception is raised.
+        http.queue_response(200, None, content=feed)
+        assert_raises_regexp(
+            BadResponseException, ".*Expected Atom feed, got None.*", follow
+        )
+
+        http.queue_response(200, "not/atom", content=feed)
+        assert_raises_regexp(
+            BadResponseException, ".*Expected Atom feed, got not/atom.*", follow
+        )
 
     def test_import_one_feed(self):
         # Check coverage records are created.
@@ -1725,3 +2036,33 @@ class TestOPDSImportMonitor(OPDSImporterTest):
 
         # Feeds are imported in reverse order
         eq_(["last page", "second page", "first page"], monitor.imports)
+
+    def test_update_headers(self):
+        """Test the _update_headers helper method."""
+        monitor = OPDSImportMonitor(
+            self._db, collection=self._default_collection,
+            import_class=OPDSImporter
+        )
+
+        # _update_headers return a new dictionary. By default, only an
+        # Accept header is added.
+        headers = {'Some other': 'header'}
+        new_headers = monitor._update_headers(headers)
+        eq_(['Some other'], headers.keys())
+        eq_(['Some other', 'Accept'], new_headers.keys())
+
+        # If the monitor has a username and password, an Authorization
+        # header using HTTP Basic Authentication is also added.
+        monitor.username = "a user"
+        monitor.password = "a password"
+        headers = {}
+        new_headers = monitor._update_headers(headers)
+        assert new_headers['Authorization'].startswith('Basic')
+
+        # However, if the Authorization and/or Accept headers have been
+        # filled in by some other piece of code, _update_headers does
+        # not touch them.
+        expect = dict(Accept="text/html", Authorization="Bearer abc")
+        headers = dict(expect)
+        new_headers = monitor._update_headers(headers)
+        eq_(headers, expect)

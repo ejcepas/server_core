@@ -1,4 +1,6 @@
+import os
 import json
+
 import flask
 from flask import Flask
 from flask_babel import (
@@ -23,14 +25,24 @@ from model import Identifier
 from lane import (
     Facets,
     Pagination,
+    WorkList,
 )
 
 from app_server import (
+    HeartbeatController,
     URNLookupController,
     ErrorHandler,
     ComplaintController,
     load_facets_from_request,
     load_pagination_from_request,
+)
+
+from config import Configuration
+
+from entrypoint import (
+    AudiobooksEntryPoint,
+    EbooksEntryPoint,
+    EntryPoint,
 )
 
 from problem_details import (
@@ -42,6 +54,44 @@ from util.opds_writer import (
     OPDSFeed,
     OPDSMessage,
 )
+
+
+class TestHeartbeatController(object):
+
+    def test_heartbeat(self):
+        app = Flask(__name__)
+        controller = HeartbeatController()
+
+        with app.test_request_context('/'):
+            response = controller.heartbeat()
+        eq_(200, response.status_code)
+        eq_(controller.HEALTH_CHECK_TYPE, response.headers.get('Content-Type'))
+        data = json.loads(response.data)
+        eq_('pass', data['status'])
+
+        # Create a .version file.
+        root_dir = os.path.join(os.path.split(__file__)[0], "..", "..")
+        version_filename = os.path.join(root_dir, controller.VERSION_FILENAME)
+        with open(version_filename, 'w') as f:
+            f.write('ba.na.na-10-ssssssssss')
+
+        # Create a mock configuration object to test with.
+        class MockConfiguration(Configuration):
+            instance = dict()
+
+        with app.test_request_context('/'):
+            response = controller.heartbeat(conf_class=MockConfiguration)
+        if os.path.exists(version_filename):
+            os.remove(version_filename)
+
+        eq_(200, response.status_code)
+        content_type = response.headers.get('Content-Type')
+        eq_(controller.HEALTH_CHECK_TYPE, content_type)
+
+        data = json.loads(response.data)
+        eq_('pass', data['status'])
+        eq_('ba.na.na', data['version'])
+        eq_('ba.na.na-10-ssssssssss', data['releaseID'])
 
 
 class TestURNLookupController(DatabaseTest):
@@ -124,7 +174,7 @@ class TestURNLookupController(DatabaseTest):
     @app.route('/work')
     def work(self, urn):
         pass
-    
+
     def test_work_lookup(self):
         work = self._work(with_license_pool=True)
         identifier = work.license_pools[0].identifier
@@ -213,8 +263,13 @@ class TestLoadMethods(DatabaseTest):
         self.app = Flask(__name__)
         Babel(self.app)
 
-
     def test_load_facets_from_request(self):
+        # The library has two EntryPoints enabled.
+        self._default_library.setting(EntryPoint.ENABLED_SETTING).value = (
+            json.dumps([EbooksEntryPoint.INTERNAL_NAME,
+                        AudiobooksEntryPoint.INTERNAL_NAME])
+        )
+
         with self.app.test_request_context('/?order=%s' % Facets.ORDER_TITLE):
             flask.request.library = self._default_library
             facets = load_facets_from_request()
@@ -227,6 +282,43 @@ class TestLoadMethods(DatabaseTest):
             flask.request.library = self._default_library
             problemdetail = load_facets_from_request()
             eq_(INVALID_INPUT.uri, problemdetail.uri)
+
+        # An EntryPoint will be picked up from the request and passed
+        # into the Facets object, assuming the EntryPoint is
+        # configured on the present library.
+        worklist = WorkList()
+        worklist.initialize(self._default_library)
+        with self.app.test_request_context('/?entrypoint=Audio'):
+            flask.request.library = self._default_library
+            facets = load_facets_from_request(worklist=worklist)
+            eq_(AudiobooksEntryPoint, facets.entrypoint)
+
+        # If it's not configured, the default EntryPoint is used.
+        with self.app.test_request_context('/?entrypoint=NoSuchEntryPoint'):
+            flask.request.library = self._default_library
+            facets = load_facets_from_request(worklist=worklist)
+            eq_(EbooksEntryPoint, facets.entrypoint)
+
+
+    def test_load_facets_from_request_class_instantiation(self):
+        """The caller of load_facets_from_request() can specify a class other
+        than Facets to call from_request() on.
+        """
+        class MockFacets(object):
+            @classmethod
+            def from_request(*args, **kwargs):
+                facets = MockFacets()
+                facets.called_with = kwargs
+                return facets
+        kwargs = dict(some_arg='some value')
+        with self.app.test_request_context(''):
+            flask.request.library = self._default_library
+            facets = load_facets_from_request(
+                None, None, base_class=MockFacets,
+                base_class_constructor_kwargs=kwargs
+            )
+        assert isinstance(facets, MockFacets)
+        eq_('some value', facets.called_with['some_arg'])
 
     def test_load_pagination_from_request(self):
         with self.app.test_request_context('/?size=50&after=10'):

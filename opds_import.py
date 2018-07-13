@@ -23,6 +23,7 @@ from util.xmlparser import XMLParser
 from config import (
     CannotLoadConfiguration,
     Configuration,
+    IntegrationException,
 )
 from metadata_layer import (
     CirculationData,
@@ -46,6 +47,7 @@ from model import (
     Identifier,
     LicensePool,
     Measurement,
+    Representation,
     Subject,
     RightsStatus,
 )
@@ -58,7 +60,8 @@ from util.opds_writer import (
     OPDSFeed,
     OPDSMessage,
 )
-from s3 import S3Uploader
+from mirror import MirrorUploader
+from selftest import HasSelfTests
 
 
 class AccessNotAuthenticated(Exception):
@@ -103,7 +106,7 @@ class SimplifiedOPDSLookup(object):
 
     def _get(self, url, **kwargs):
         """Make an HTTP request. This method is overridden in the mock class."""
-        kwargs['timeout'] = kwargs.get('timeout', 120)
+        kwargs['timeout'] = kwargs.get('timeout', 300)
         kwargs['allowed_response_codes'] = kwargs.get('allowed_response_codes', [])
         kwargs['allowed_response_codes'] += ['2xx', '3xx']
         return HTTP.get_with_timeout(url, **kwargs)
@@ -123,6 +126,7 @@ class MetadataWranglerOPDSLookup(SimplifiedOPDSLookup):
 
     PROTOCOL = ExternalIntegration.METADATA_WRANGLER
     NAME = _("Library Simplified Metadata Wrangler")
+    CARDINALITY = 1
 
     SETTINGS = [
         { "key": ExternalIntegration.URL, "label": _("URL"), "default": "http://metadata.librarysimplified.org/" },
@@ -132,6 +136,7 @@ class MetadataWranglerOPDSLookup(SimplifiedOPDSLookup):
 
     ADD_ENDPOINT = 'add'
     ADD_WITH_METADATA_ENDPOINT = 'add_with_metadata'
+    METADATA_NEEDED_ENDPOINT = 'metadata_needed'
     REMOVE_ENDPOINT = 'remove'
     UPDATES_ENDPOINT = 'updates'
     CANONICALIZE_ENDPOINT = 'canonical-author-name'
@@ -231,6 +236,15 @@ class MetadataWranglerOPDSLookup(SimplifiedOPDSLookup):
         """Add a feed of items with metadata to an authenticated Metadata Wrangler Collection."""
         add_with_metadata_url = self.get_collection_url(self.ADD_WITH_METADATA_ENDPOINT)
         return self._post(add_with_metadata_url, unicode(feed))
+
+    def metadata_needed(self):
+        """Get a feed of items that need additional metadata to be processed
+        by the Metadata Wrangler.
+        """
+        metadata_needed_url = self.get_collection_url(
+            self.METADATA_NEEDED_ENDPOINT
+        )
+        return self._get(metadata_needed_url)
 
     def remove(self, identifiers):
         """Remove items from an authenticated Metadata Wrangler Collection"""
@@ -334,7 +348,9 @@ class OPDSImporter(object):
 
     NAME = ExternalIntegration.OPDS_IMPORT
     DESCRIPTION = _("Import books from a publicly-accessible OPDS feed.")
-    SETTINGS = [
+
+    # These settings are used by all OPDS-derived import methods.
+    BASE_SETTINGS = [
         {
             "key": Collection.EXTERNAL_ACCOUNT_ID_KEY,
             "label": _("URL"),
@@ -342,7 +358,24 @@ class OPDSImporter(object):
         {
             "key": Collection.DATA_SOURCE_NAME_SETTING,
             "label": _("Data source name"),
-        }
+        },
+    ]
+
+    # These settings are used by 'regular' OPDS but not by OPDS For
+    # Distributors, which has its own way of doing authentication.
+    SETTINGS = BASE_SETTINGS + [
+        {
+            "key": ExternalIntegration.USERNAME,
+            "label": _("Username"),
+            "optional": True,
+            "description": _("If HTTP Basic authentication is required to access the OPDS feed (it usually isn't), enter the username here."),
+        },
+        {
+            "key": ExternalIntegration.PASSWORD,
+            "label": _("Password"),
+            "optional": True,
+            "description": _("If HTTP Basic authentication is required to access the OPDS feed (it usually isn't), enter the password here."),
+        },
     ]
 
     # Subclasses of OPDSImporter may define a different parser class that's
@@ -409,9 +442,19 @@ class OPDSImporter(object):
             # The Metadata Wrangler isn't configured, but we can import without it.
             self.log.warn("Metadata Wrangler integration couldn't be loaded, importing without it.")
             self.metadata_client = None
+
+        if collection and not mirror:
+            # If this Collection is configured to mirror the assets it
+            # discovers, this will create a MirrorUploader for that
+            # Collection. Otherwise, this will return None.
+            mirror = MirrorUploader.for_collection(collection)
         self.mirror = mirror
         self.content_modifier = content_modifier
-        self.http_get = http_get
+
+        # In general, we are cautious when mirroring resources so that
+        # we don't, e.g. accidentally get our IP banned from
+        # gutenberg.org.
+        self.http_get = http_get or Representation.cautious_http_get
         self.map_from_collection = map_from_collection
 
     @property
@@ -424,6 +467,74 @@ class OPDSImporter(object):
             self._db, self.data_source_name, autocreate=True,
             offers_licenses = offers_licenses
         )
+
+    def assert_importable_content(self, feed, feed_url, max_get_attempts=5):
+        """Raise an exception if the given feed contains nothing that can,
+        even theoretically, be turned into a LicensePool.
+
+        By default, this means the feed must link to open-access content
+        that can actually be retrieved.
+        """
+        metadata, failures = self.extract_feed_data(feed, feed_url)
+        get_attempts = 0
+
+        # Find an open-access link, and try to GET it just to make
+        # sure OPDS feed isn't hiding non-open-access stuff behind an
+        # open-access link.
+        #
+        # To avoid taking forever or antagonizing API providers, we'll
+        # give up after `max_get_attempts` failures.
+        for link in self._open_access_links(metadata.values()):
+            url = link.href
+            success = self._is_open_access_link(url, link.media_type)
+            if success:
+                return success
+            get_attempts += 1
+            if get_attempts >= max_get_attempts:
+                error = "Was unable to GET supposedly open-access content such as %s (tried %s times)" % (
+                    url, get_attempts
+                )
+                explanation = "This might be an OPDS For Distributors feed, or it might require different authentication credentials."
+                raise IntegrationException(error, explanation)
+
+        raise IntegrationException(
+            "No open-access links were found in the OPDS feed.",
+            "This might be an OPDS for Distributors feed."
+        )
+
+    @classmethod
+    def _open_access_links(cls, metadatas):
+        """Find all open-access links in a list of Metadata objects.
+
+        :param metadatas: A list of Metadata objects.
+        :yield: A sequence of `LinkData` objects.
+        """
+        for item in metadatas:
+            if not item.circulation:
+                continue
+            for link in item.circulation.links:
+                if link.rel == Hyperlink.OPEN_ACCESS_DOWNLOAD:
+                    yield link
+
+    def _is_open_access_link(self, url, type):
+        """Is `url` really an open-access link?
+
+        That is, can we make a normal GET request and get something
+        that looks like a book?
+        """
+        headers = {}
+        if type:
+            headers["Accept"] = type
+        status, headers, body = self.http_get(url, headers=headers)
+        if status == 200 and len(body) > 1024 * 10:
+            # We could also check the media types, but this is good
+            # enough for now.
+            return "Found a book-like thing at %s" % url
+        self.log.error(
+            "Supposedly open-access link %s didn't give us a book. Status=%s, body length=%s",
+            url, status, len(body)
+        )
+        return False
         
     def import_from_feed(self, feed, even_if_no_author=False, 
                          immediately_presentation_ready=False,
@@ -566,21 +677,29 @@ class OPDSImporter(object):
             parsed_feed = feedparser.parse(feed)
         else:
             parsed_feed = feed
-        return [
+        dates = [
             cls.last_update_date_for_feedparser_entry(entry)
             for entry in parsed_feed['entries']
         ]
+        return [x for x in dates if x and x[1]]
 
     def build_identifier_mapping(self, external_urns):
         """Uses the given Collection and a list of URNs to reverse
         engineer an identifier mapping.
+
+        NOTE: It would be better if .identifier_mapping weren't
+        instance data, since a single OPDSImporter might import
+        multiple pages of a feed. However, the code as written should
+        work.
         """
-        if self.identifier_mapping or not self.collection:
+        if not self.collection:
             return
 
         mapping = dict()
-        external_identifiers = [Identifier.parse_urn(self._db, urn)[0]
-                                for urn in external_urns]
+        identifiers_by_urn, failures = Identifier.parse_urns(
+            self._db, external_urns, autocreate=False
+        )
+        external_identifiers = identifiers_by_urn.values()
 
         internal_identifier = aliased(Identifier)
         qu = self._db.query(Identifier, internal_identifier)\
@@ -929,7 +1048,6 @@ class OPDSImporter(object):
                         )
                     )
         last_opds_update = cls._datetime(entry, 'updated_parsed')
-        added_to_collection_time = cls._datetime(entry, 'published_parsed')
             
         publisher = entry.get('publisher', None)
         if not publisher:
@@ -1406,7 +1524,8 @@ class OPDSImporter(object):
         series_position = attr.get('{http://schema.org/}position', None)
         return series_name, series_position
 
-class OPDSImportMonitor(CollectionMonitor):
+
+class OPDSImportMonitor(CollectionMonitor, HasSelfTests):
 
     """Periodically monitor a Collection's OPDS archive feed and import
     every title it mentions.
@@ -1438,36 +1557,88 @@ class OPDSImportMonitor(CollectionMonitor):
                 )
             )
 
-        data_source = collection.data_source
+        data_source = self.data_source(collection)
         if not data_source:
             raise ValueError(
                 "Collection %s has no associated data source." % collection.name
             )
 
-        self.feed_url = collection.external_account_id
+        self.external_integration_id = collection.external_integration.id
+        self.feed_url = self.opds_url(collection)
         self.force_reimport = force_reimport
+        self.username = collection.external_integration.username
+        self.password = collection.external_integration.password
         self.importer = import_class(
             _db, collection=collection, **import_class_kwargs
         )
         super(OPDSImportMonitor, self).__init__(_db, collection)
-    
+
+    def external_integration(self, _db):
+        return get_one(_db, ExternalIntegration,
+                       id=self.external_integration_id)
+
+    def _run_self_tests(self, _db):
+        """Retrieve the first page of the OPDS feed"""
+        first_page = self.run_test(
+            "Retrieve the first page of the OPDS feed (%s)" % self.feed_url,
+            self.follow_one_link, self.feed_url
+        )
+        yield first_page
+        if not first_page.result:
+            return
+
+        # We got a page, but does it have anything the importer can
+        # turn into a Work?
+        #
+        # By default, this means it must contain an open-access link.
+        url, content = first_page.result
+        yield self.run_test(
+            "Checking for importable content",
+            self.importer.assert_importable_content,
+            content, url
+        )
+
     def _get(self, url, headers):
         """Make the sort of HTTP request that's normal for an OPDS feed.
 
         Long timeout, raise error on anything but 2xx or 3xx.
         """
-        headers = dict(headers or {})
-
-        types = dict(
-            opds_acquisition=OPDSFeed.ACQUISITION_FEED_TYPE,
-            atom="application/atom+xml",
-            xml="application/xml",
-            anything="*/*",
-        )
-        headers['Accept'] = "%(opds_acquisition)s, %(atom)s;q=0.9, %(xml)s;q=0.8, %(anything)s;q=0.1" % types
+        headers = self._update_headers(headers)
         kwargs = dict(timeout=120, allowed_response_codes=['2xx', '3xx'])
         response = HTTP.get_with_timeout(url, headers=headers, **kwargs)
         return response.status_code, response.headers, response.content
+
+    def _update_headers(self, headers):
+        headers = dict(headers or {})
+        if self.username and self.password and not 'Authorization' in headers:
+            auth_header = "Basic %s" % base64.b64encode("%s:%s" % (self.username, self.password))
+            headers['Authorization'] = auth_header
+
+        if not 'Accept' in headers:
+            types = dict(
+                opds_acquisition=OPDSFeed.ACQUISITION_FEED_TYPE,
+                atom="application/atom+xml",
+                xml="application/xml",
+                anything="*/*",
+            )
+            headers['Accept'] = "%(opds_acquisition)s, %(atom)s;q=0.9, %(xml)s;q=0.8, %(anything)s;q=0.1" % types
+        return headers
+
+    def opds_url(self, collection):
+        """Returns the OPDS import URL for the given collection.
+
+        By default, this URL is stored as the external account ID, but
+        subclasses may override this.
+        """
+        return collection.external_account_id
+
+    def data_source(self, collection):
+        """Returns the data source name for the given collection.
+
+        By default, this URL is stored as a setting on the collection, but
+        subclasses may hard-code it.
+        """
+        return collection.data_source
 
     def feed_contains_new_data(self, feed):
         """Does the given feed contain any entries that haven't been imported
@@ -1569,7 +1740,19 @@ class OPDSImportMonitor(CollectionMonitor):
         """
         self.log.info("Following next link: %s", url)
         get = do_get or self._get
-        status_code, content_type, feed = get(url, None)
+        status_code, headers, feed = get(url, {})
+
+        # Make sure we got an OPDS feed, and not an error page that was
+        # sent with a 200 status code.
+        media_type = headers.get('content-type')
+        if not media_type or not any(
+            x in media_type for x in (OPDSFeed.ATOM_LIKE_TYPES)
+        ):
+            message = "Expected Atom feed, got %s" % media_type
+            raise BadResponseException(
+                url, message=message, debug_message=feed,
+                status_code=status_code
+            )
 
         new_data = self.feed_contains_new_data(feed)
 
@@ -1592,7 +1775,7 @@ class OPDSImportMonitor(CollectionMonitor):
         imported_editions, pools, works, failures = self.importer.import_from_feed(
             feed, even_if_no_author=True,
             immediately_presentation_ready = True,
-            feed_url=self.collection.external_account_id
+            feed_url=self.opds_url(self.collection)
         )
 
         # Create CoverageRecords for the successful imports.
@@ -1636,15 +1819,3 @@ class OPDSImportMonitor(CollectionMonitor):
             self.log.info("Importing next feed: %s", link)
             self.import_one_feed(feed)
             self._db.commit()
-
-
-class OPDSImporterWithS3Mirror(OPDSImporter):
-    """OPDS Importer that mirrors content to S3."""
-
-    def __init__(self, _db, collection, **kwargs):
-        kwargs = dict(kwargs)
-        if 'mirror' not in kwargs:
-            kwargs['mirror'] = S3Uploader.from_config(_db)
-        super(OPDSImporterWithS3Mirror, self).__init__(
-            _db, collection, **kwargs
-        )

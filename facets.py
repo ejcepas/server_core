@@ -2,6 +2,12 @@ from flask_babel import lazy_gettext as _
 
 class FacetConstants(object):
 
+    # A special constant, basically an additional rel, indicating that
+    # an OPDS facet group represents different entry points into a
+    # WorkList.
+    ENTRY_POINT_REL = 'http://librarysimplified.org/terms/rel/entrypoint'
+    ENTRY_POINT_FACET_GROUP_NAME = 'entrypoint'
+
     # Subset the collection, roughly, by quality.
     COLLECTION_FACET_GROUP_NAME = 'collection'
     COLLECTION_FULL = "full"
@@ -126,9 +132,10 @@ class FacetConfig(object):
         
         return FacetConfig(enabled_facets, default_facets)
 
-    def __init__(self, enabled_facets, default_facets):
+    def __init__(self, enabled_facets, default_facets, entrypoints=[]):
         self._enabled_facets = dict(enabled_facets)
         self._default_facets = dict(default_facets)
+        self.entrypoints = entrypoints
 
     def enabled_facets(self, group_name):
         return self._enabled_facets.get(group_name)

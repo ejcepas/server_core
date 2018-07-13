@@ -50,7 +50,7 @@ from metadata_layer import (
     ReplacementPolicy,
     SubjectData,
 )
-from s3 import DummyS3Uploader
+from s3 import MockS3Uploader
 from coverage import (
     BaseCoverageProvider,
     BibliographicCoverageProvider,
@@ -58,6 +58,8 @@ from coverage import (
     CollectionCoverageProvider,
     CoverageFailure,
     IdentifierCoverageProvider,
+    OPDSEntryWorkCoverageProvider,
+    PresentationReadyWorkCoverageProvider,
 )
 
 class TestCoverageFailure(DatabaseTest):
@@ -211,10 +213,10 @@ class TestBaseCoverageProvider(CoverageProviderTest):
         assert (datetime.datetime.utcnow() - value).total_seconds() < 1
 
         # run_once was called twice: once to exclude items that have
-        # any coverage record whatsoever (ALL_STATUSES), and again to
+        # any coverage record whatsoever (PREVIOUSLY_ATTEMPTED), and again to
         # exclude only items that have coverage records that indicate
         # success or persistent failure (DEFAULT_COUNT_AS_COVERED).
-        eq_([CoverageRecord.ALL_STATUSES,
+        eq_([CoverageRecord.PREVIOUSLY_ATTEMPTED,
              CoverageRecord.DEFAULT_COUNT_AS_COVERED], provider.run_once_calls)
         
     def test_run_once(self):
@@ -419,7 +421,10 @@ class TestBaseCoverageProvider(CoverageProviderTest):
         record.timestamp = cutoff
         eq_(False, provider.should_update(record))
 
-    
+        # If coverage is only 'registered', we should update.
+        record.status = CoverageRecord.REGISTERED
+        eq_(True, provider.should_update(record))
+
 
 class TestIdentifierCoverageProvider(CoverageProviderTest):
 
@@ -465,6 +470,28 @@ class TestIdentifierCoverageProvider(CoverageProviderTest):
             self._db
         )
 
+    def test_can_cover(self):
+        """Verify that can_cover gives the correct answer when
+        asked if an IdentifierCoverageProvider can handle a given Identifier.
+        """
+        provider = AlwaysSuccessfulCoverageProvider(self._db)
+        identifier = self._identifier(identifier_type=Identifier.ISBN)
+        m = provider.can_cover
+
+        # This provider handles all identifier types.
+        provider.input_identifier_types = None
+        eq_(True, m(identifier))
+
+        # This provider handles ISBNs.
+        provider.input_identifier_types = [
+            Identifier.OVERDRIVE_ID, Identifier.ISBN
+        ]
+        eq_(True, m(identifier))
+
+        # This provider doesn't.
+        provider.input_identifier_types = [Identifier.OVERDRIVE_ID]
+        eq_(False, m(identifier))
+
     def test_replacement_policy(self):
         """Unless a different replacement policy is passed in, the
         default is ReplacementPolicy.from_metadata_source().
@@ -487,33 +514,110 @@ class TestIdentifierCoverageProvider(CoverageProviderTest):
         
         # If a CoverageRecord doesn't exist for the provider,
         # a 'registered' record is created.
-        provider.register(self.identifier)
+        new_record, was_registered = provider.register(self.identifier)
 
-        [record] = self.identifier.coverage_records
-        eq_(provider.DATA_SOURCE_NAME, record.data_source.name)
-        eq_(CoverageRecord.REGISTERED, record.status)
-        eq_(None, record.exception)
+        eq_(self.identifier.coverage_records, [new_record])
+        eq_(provider.DATA_SOURCE_NAME, new_record.data_source.name)
+        eq_(CoverageRecord.REGISTERED, new_record.status)
+        eq_(None, new_record.exception)
 
         # If a CoverageRecord exists already, it's returned.
-        existing = record
+        existing = new_record
         existing.status = CoverageRecord.SUCCESS
 
-        provider.register(self.identifier)
-        [record] = self.identifier.coverage_records
-        eq_(existing, record)
+        new_record, was_registered = provider.register(self.identifier)
+        eq_(existing, new_record)
+        eq_(False, was_registered)
         # Its details haven't been changed in any way.
-        eq_(CoverageRecord.SUCCESS, record.status)
-        eq_(None, record.exception)
+        eq_(CoverageRecord.SUCCESS, new_record.status)
+        eq_(None, new_record.exception)
+
+    def test_bulk_register(self):
+        provider = AlwaysSuccessfulCoverageProvider
+        source = DataSource.lookup(self._db, provider.DATA_SOURCE_NAME)
+
+        i1 = self._identifier()
+        covered = self._identifier()
+        existing = self._coverage_record(
+            covered, source, operation=provider.OPERATION
+        )
+
+        new_records, ignored_identifiers = provider.bulk_register([i1, covered])
+
+        eq_(i1.coverage_records, new_records)
+        [new_record] = new_records
+        eq_(provider.DATA_SOURCE_NAME, new_record.data_source.name)
+        eq_(provider.OPERATION, new_record.operation)
+        eq_(CoverageRecord.REGISTERED, new_record.status)
+
+        eq_([covered], ignored_identifiers)
+        # The existing CoverageRecord hasn't been changed.
+        eq_(CoverageRecord.SUCCESS, existing.status)
+
+    def test_bulk_register_can_overwrite_existing_record_status(self):
+        provider = AlwaysSuccessfulCoverageProvider
+
+        # Create an existing record, and give it a SUCCESS status.
+        provider.bulk_register([self.identifier])
+        [existing] = self.identifier.coverage_records
+        existing.status = CoverageRecord.SUCCESS
+        self._db.commit()
+
+        # If registration is forced, an existing record is updated.
+        records, ignored = provider.bulk_register([self.identifier], force=True)
+        eq_([existing], records)
+        eq_(CoverageRecord.REGISTERED, existing.status)
+
+    def test_bulk_register_with_collection(self):
+        provider = AlwaysSuccessfulCoverageProvider
+        collection = self._collection(data_source_name=DataSource.AXIS_360)
+
+        try:
+            # If a DataSource or data source name is provided and
+            # autocreate is set True, the record is created with that source.
+            provider.bulk_register(
+                [self.identifier], data_source=collection.name,
+                collection=collection, autocreate=True
+            )
+            [record] = self.identifier.coverage_records
+
+            # A DataSource with the given name has been created.
+            collection_source = DataSource.lookup(self._db, collection.name)
+            assert collection_source
+            assert provider.DATA_SOURCE_NAME != record.data_source.name
+            eq_(collection_source, record.data_source)
+
+            # Even though a collection was given, the record's collection isn't
+            # set.
+            eq_(None, record.collection)
+
+            # However, when coverage is collection-specific the
+            # CoverageRecord is related to the given collection.
+            provider.COVERAGE_COUNTS_FOR_EVERY_COLLECTION = False
+
+            provider.bulk_register(
+                [self.identifier], collection_source, collection=collection
+            )
+            records = self.identifier.coverage_records
+            eq_(2, len(records))
+            assert [r for r in records if r.collection==collection]
+        finally:
+            # Return the mock class to its original state for other tests.
+            provider.COVERAGE_COUNTS_FOR_EVERY_COLLECTION = True
 
     def test_ensure_coverage(self):
         """Verify that ensure_coverage creates a CoverageRecord for an
         Identifier, assuming that the CoverageProvider succeeds.
         """
-        provider = AlwaysSuccessfulCoverageProvider(self._db)
+        provider = AlwaysSuccessfulCollectionCoverageProvider(
+            self._default_collection
+        )
+        provider.OPERATION = self._str
         record = provider.ensure_coverage(self.identifier)
         assert isinstance(record, CoverageRecord)
         eq_(self.identifier, record.identifier)
         eq_(provider.data_source, record.data_source)
+        eq_(provider.OPERATION, record.operation)
         eq_(None, record.exception)
 
         # There is now one CoverageRecord -- the one returned by
@@ -521,11 +625,27 @@ class TestIdentifierCoverageProvider(CoverageProviderTest):
         [record2] = self._db.query(CoverageRecord).all()
         eq_(record2, record)
 
+        # Because this provider counts coverage in one Collection as
+        # coverage for all Collections, the coverage record was not
+        # associated with any particular collection.
+        eq_(True, provider.COVERAGE_COUNTS_FOR_EVERY_COLLECTION)
+        eq_(None, record2.collection)
+
         # The coverage provider's timestamp was not updated, because
         # we're using ensure_coverage on a single record.
         eq_(None,
             Timestamp.value(self._db, provider.service_name, collection=None)
         )
+
+        # Now let's try a CollectionCoverageProvider that needs to
+        # grant coverage separately for every collection.
+        provider.COVERAGE_COUNTS_FOR_EVERY_COLLECTION = False
+        record3 = provider.ensure_coverage(self.identifier)
+
+        # This creates a new CoverageRecord associated with the
+        # provider's collection.
+        assert record3 != record2
+        eq_(provider.collection, record3.collection)
 
     def test_ensure_coverage_works_on_edition(self):
         """Verify that ensure_coverage() works on an Edition by covering
@@ -704,7 +824,7 @@ class TestIdentifierCoverageProvider(CoverageProviderTest):
 
     def test_items_that_need_coverage_respects_registration_reqs(self):
         provider = AlwaysSuccessfulCoverageProvider(
-            self._db, preregistered_only=True
+            self._db, registered_only=True
         )
 
         items = provider.items_that_need_coverage()
@@ -1209,7 +1329,7 @@ class TestCollectionCoverageProvider(CoverageProviderTest):
         )
         
         # ..and will then be uploaded to this 'mirror'.
-        mirror = DummyS3Uploader()
+        mirror = MockS3Uploader()
 
         class Tripwire(PresentationCalculationPolicy):
             # This class sets a variable if one of its properties is
@@ -1344,7 +1464,42 @@ class TestCollectionCoverageProvider(CoverageProviderTest):
         work = provider.work(identifier)
         assert isinstance(work, Work)
         eq_(u"A title", work.title)
-        
+
+        # If necessary, we can tell work() to use a specific
+        # LicensePool when calculating the Work. This is an extreme
+        # example in which the LicensePool to use has a different
+        # Identifier (identifier2) than the Identifier we're
+        # processing (identifier1).
+        #
+        # In a real case, this would be used by a CoverageProvider
+        # that just had to create a LicensePool using an
+        # INTERNAL_PROCESSING DataSource rather than the DataSource
+        # associated with the CoverageProvider.
+        identifier2 = self._identifier()
+        identifier.licensed_through = []
+        collection2 = self._collection()
+        edition2 = self._edition(identifier_type=identifier2.type,
+                                 identifier_id=identifier2.identifier)
+        pool2 = self._licensepool(edition=edition2, collection=collection2)
+        work2 = provider.work(identifier, pool2)
+        assert work2 != work
+        eq_([pool2], work2.license_pools)
+
+        # Once an identifier has a work associated with it,
+        # that's always the one that's used, and the value of license_pool
+        # is ignored.
+        work3 = provider.work(identifier2, object())
+        eq_(work2, work3)
+
+        # Any keyword arguments passed into work() are propagated to
+        # calculate_work(). This lets use (e.g.) create a Work even
+        # when there is no title.
+        edition, pool = self._edition(with_license_pool=True)
+        edition.title = None
+        work = provider.work(pool.identifier, pool, even_if_no_title=True)
+        assert isinstance(work, Work)
+        eq_(None, work.title)
+
     def test_set_metadata_and_circulationdata(self):
         """Verify that a CollectionCoverageProvider can set both
         metadata (on an Edition) and circulation data (on a LicensePool).
@@ -1449,7 +1604,32 @@ class TestCollectionCoverageProvider(CoverageProviderTest):
         # as before.
         pool2 = provider.license_pool(identifier)
         eq_(pool, pool2)
-        
+
+        # It's possible for a CollectionCoverageProvider to create a
+        # LicensePool for a different DataSource than the one
+        # associated with the Collection. Only the metadata wrangler
+        # needs to do this -- it's so a CoverageProvider for a
+        # third-party DataSource can create an 'Internal Processing'
+        # LicensePool when some other part of the metadata wrangler
+        # failed to do this earlier.
+
+        # If a working pool already exists, it's returned and no new
+        # pool is created.
+        same_pool = provider.license_pool(
+            identifier, DataSource.INTERNAL_PROCESSING
+        )
+        eq_(same_pool, pool2)
+        eq_(provider.data_source, same_pool.data_source)
+
+        # A new pool is only created if no working pool can be found.
+        identifier2 = self._identifier()
+        new_pool = provider.license_pool(
+            identifier2, DataSource.INTERNAL_PROCESSING
+        )
+        eq_(new_pool.data_source.name, DataSource.INTERNAL_PROCESSING)
+        eq_(new_pool.identifier, identifier2)
+        eq_(new_pool.collection, provider.collection)
+
     def test_set_presentation_ready(self):
         """Test that a CollectionCoverageProvider can set a Work
         as presentation-ready.
@@ -1681,3 +1861,46 @@ class TestWorkCoverageProvider(DatabaseTest):
         """TODO: We have coverage of code that calls this method,
         but not the method itself.
         """
+
+
+class TestPresentationReadyWorkCoverageProvider(DatabaseTest):
+
+    def test_items_that_need_coverage(self):
+
+        class Mock(PresentationReadyWorkCoverageProvider):
+            SERVICE_NAME = 'mock'
+
+        provider = Mock(self._db)
+        work = self._work()
+
+        # The work is not presentation ready and so is not ready for
+        # coverage.
+        eq_(False, work.presentation_ready)
+        eq_([], provider.items_that_need_coverage().all())
+
+        # Make it presentation ready, and it needs coverage.
+        work.presentation_ready = True
+        eq_([work], provider.items_that_need_coverage().all())
+
+
+class TestOPDSEntryWorkCoverageProvider(DatabaseTest):
+
+    def test_run(self):
+
+        provider = OPDSEntryWorkCoverageProvider(self._db)
+        work = self._work()
+        work.simple_opds_entry = 'old junk'
+        work.verbose_opds_entry = 'old long junk'
+
+        # The work is not presentation-ready, so nothing happens.
+        provider.run()
+        eq_('old junk', work.simple_opds_entry)
+        eq_('old long junk', work.verbose_opds_entry)
+
+        # The work is presentation-ready, so its OPDS entries are
+        # regenerated.
+        work.presentation_ready = True
+        provider.run()
+        assert work.simple_opds_entry.startswith('<entry')
+        assert work.verbose_opds_entry.startswith('<entry')
+

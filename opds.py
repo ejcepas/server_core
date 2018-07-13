@@ -30,10 +30,13 @@ from lxml import builder, etree
 from cdn import cdnify
 from config import Configuration
 from classifier import Classifier
+from entrypoint import EntryPoint
+from facets import FacetConstants
 from model import (
     BaseMaterializedWork,
     CachedFeed,
     ConfigurationSetting,
+    Contributor,
     CustomList,
     CustomListEntry,
     DataSource,
@@ -47,13 +50,15 @@ from model import (
 )
 from lane import (
     Facets,
+    FacetsWithEntryPoint,
     Lane,
     Pagination,
+    SearchFacets,
     WorkList,
 )
 from util.opds_writer import (
     AtomFeed,
-    OPDSFeed, 
+    OPDSFeed,
     OPDSMessage,
 )
 
@@ -74,20 +79,93 @@ class Annotator(object):
 
     opds_cache_field = Work.simple_opds_entry.name
 
-    @classmethod
-    def annotate_work_entry(cls, work, active_license_pool, edition, 
-                            identifier, feed, entry):
+    def annotate_work_entry(self, work, active_license_pool, edition,
+                            identifier, feed, entry, updated=None):
         """Make any custom modifications necessary to integrate this
         OPDS entry into the application's workflow.
+
+        :work: The Work whose OPDS entry is being annotated.
+        :active_license_pool: Of all the LicensePools associated with this
+           Work, the client has expressed interest in this one.
+        :edition: The Edition to use when associating bibliographic
+           metadata with this entry. You will probably not need to use
+           this, because bibliographic metadata was associated with
+           the entry when it was created.
+        :identifier: Of all the Identifiers associated with this
+           Work, the client has expressed interest in this one.
+        :param feed: An OPDSFeed -- the feed in which this entry will be
+           situated.
+        :param entry: An lxml Element object, the entry that will be added
+           to the feed.
         """
-        if active_license_pool:
-            provider_name_attr = "{%s}ProviderName" % AtomFeed.BIBFRAME_NS
-            kwargs = {provider_name_attr : active_license_pool.data_source.name}
-            data_source_tag = AtomFeed.makeelement(
-                "{%s}distribution" % AtomFeed.BIBFRAME_NS,
-                **kwargs
+
+        # First, try really hard to find an Identifier that we can
+        # use to make the <id> tag.
+        if not identifier:
+            if active_license_pool:
+                identifier = active_license_pool.identifier
+            elif edition:
+                identifier = edition.primary_identifier
+
+        if identifier:
+            entry.append(AtomFeed.id(identifier.urn))
+
+        # Add a permalink if one is available.
+        permalink_uri, permalink_type = self.permalink_for(
+            work, active_license_pool, identifier
+        )
+        if permalink_uri:
+            OPDSFeed.add_link_to_entry(
+                entry, rel='alternate', href=permalink_uri,
+                type=permalink_type
             )
-            entry.extend([data_source_tag])
+
+        if active_license_pool:
+            data_source = active_license_pool.data_source.name
+            if data_source != DataSource.INTERNAL_PROCESSING:
+                # INTERNAL_PROCESSING indicates a dummy LicensePool
+                # created as a stand-in, e.g. by the metadata wrangler.
+                # This component is not actually distributing the book,
+                # so it should not have a bibframe:distribution tag.
+                provider_name_attr = "{%s}ProviderName" % AtomFeed.BIBFRAME_NS
+                kwargs = {provider_name_attr : data_source}
+                data_source_tag = AtomFeed.makeelement(
+                    "{%s}distribution" % AtomFeed.BIBFRAME_NS,
+                    **kwargs
+                )
+                entry.extend([data_source_tag])
+
+            # We use Atom 'published' for the date the book first became
+            # available to people using this application.
+            avail = active_license_pool.availability_time
+            if avail:
+                now = datetime.datetime.utcnow()
+                today = datetime.date.today()
+                if isinstance(avail, datetime.datetime):
+                    avail = avail.date()
+                if avail <= today: # Avoid obviously wrong values.
+                    availability_tag = AtomFeed.makeelement("published")
+                    # TODO: convert to local timezone.
+                    availability_tag.text = AtomFeed._strftime(avail)
+                    entry.extend([availability_tag])
+
+        # If this OPDS entry is being used as part of a grouped feed
+        # (which is up to the Annotator subclass), we need to add a
+        # group link.
+        group_uri, group_title = self.group_uri(
+            work, active_license_pool, identifier
+        )
+        if group_uri:
+            OPDSFeed.add_link_to_entry(
+                entry, rel=OPDSFeed.GROUP_REL, href=group_uri,
+                title=unicode(group_title)
+            )
+
+        # TODO: maybe we can do better than this in calculating updated()
+        if not updated and work.last_update_time:
+            updated = work.last_update_time
+        if updated:
+            entry.extend([AtomFeed.updated(AtomFeed._strftime(updated))])
 
     @classmethod
     def annotate_feed(cls, feed, lane):
@@ -98,6 +176,14 @@ class Annotator(object):
 
     @classmethod
     def group_uri(cls, work, license_pool, identifier):
+        """The URI to be associated with this Work when making it part of
+        a grouped feed.
+
+        By default, this does nothing. See circulation/LibraryAnnotator
+        for a subclass that does something.
+
+        :return: A 2-tuple (URI, title)
+        """
         return None, ""
 
     @classmethod
@@ -120,7 +206,6 @@ class Annotator(object):
         a large number of links.
 
         :return: A 2-tuple (thumbnail_links, full_links)
-
         """
         thumbnails = []
         full = []
@@ -209,18 +294,35 @@ class Annotator(object):
         return categories
 
     @classmethod
-    def authors(cls, work, license_pool, edition, identifier):
-        """Create one or more <author> tags for the given work."""
+    def authors(cls, work, edition):
+        """Create one or more <author> and <contributor> tags for the given
+        work."""
         authors = list()
-        listed = set()
-        for author in edition.author_contributors:
-            name = author.display_name or author.sort_name
+        listed_by_role = defaultdict(set)
+        for contribution in edition.contributions:
+            contributor = contribution.contributor
+            name = contributor.display_name or contributor.sort_name
+            if contribution.role in Contributor.AUTHOR_ROLES:
+                tag_f = AtomFeed.author
+                role = None
+            else:
+                tag_f = AtomFeed.contributor
+                role = Contributor.MARC_ROLE_CODES.get(contribution.role)
+                if not role:
+                    # This contribution is not one that we publish as
+                    # a <atom:contributor> tag. Skip it.
+                    continue
+
             name_key = name.lower()
-            if name_key in listed:
+            if name_key in listed_by_role[role]:
                 continue
 
-            authors.append(AtomFeed.author(AtomFeed.name(name)))
-            listed.add(name_key)
+            properties = dict()
+            if role:
+                properties['{%s}role' % AtomFeed.OPF_NS] = role
+            tag = tag_f(AtomFeed.name(name), **properties)
+            authors.append(tag)
+            listed_by_role[role].add(name_key)
 
         if authors:
             return authors
@@ -233,7 +335,7 @@ class Annotator(object):
             return None
         series_details = dict()
         series_details['name'] = series_name
-        if series_position:
+        if series_position != None:
             series_details[AtomFeed.schema_('position')] = unicode(series_position)
         series_tag = AtomFeed.makeelement(AtomFeed.schema_("Series"), **series_details)
         return series_tag
@@ -242,7 +344,7 @@ class Annotator(object):
     def content(cls, work):
         """Return an HTML summary of this work."""
         summary = ""
-        if work: 
+        if work:
             if work.summary_text != None:
                 summary = work.summary_text
             elif work.summary and work.summary.content:
@@ -260,25 +362,34 @@ class Annotator(object):
 
     @classmethod
     def permalink_for(cls, work, license_pool, identifier):
-        """In the absence of any specific URLs, the best we can do
-        is a URN.
+        """Generate a permanent link a client can follow for information about
+        this entry, and only this entry.
+
+        Note that permalink is distinct from the Atom <id>,
+        which is always the identifier's URN.
+
+        :return: A 2-tuple (URL, media type). If a single value is
+        returned, the media type will be presumed to be that of an
+        OPDS entry.
         """
-        return identifier.urn
+        # In the absence of any specific controllers, there is no
+        # permalink. This method must be defined in a subclass.
+        return None, None
 
     @classmethod
-    def lane_url(cls, lane):
+    def lane_url(cls, lane, facets=None):
         raise NotImplementedError()
-    
+
     @classmethod
     def feed_url(cls, lane, facets=None, pagination=None):
         raise NotImplementedError()
 
     @classmethod
-    def groups_url(cls, lane):
+    def groups_url(cls, lane, facets=None):
         raise NotImplementedError()
 
     @classmethod
-    def search_url(cls, lane, query, pagination):
+    def search_url(cls, lane, query, pagination, facets=None):
         raise NotImplementedError()
 
     @classmethod
@@ -286,11 +397,11 @@ class Annotator(object):
         raise NotImplementedError()
 
     @classmethod
-    def featured_feed_url(cls, lane, order=None):
+    def featured_feed_url(cls, lane, order=None, facets=None):
         raise NotImplementedError()
 
     @classmethod
-    def facet_url(cls, facets):
+    def facet_url(cls, facets, facet=None):
         return None
 
     @classmethod
@@ -337,9 +448,15 @@ class VerboseAnnotator(Annotator):
 
     opds_cache_field = Work.verbose_opds_entry.name
 
+    def annotate_work_entry(self, work, active_license_pool, edition,
+                            identifier, feed, entry):
+        super(VerboseAnnotator, self).annotate_work_entry(
+            work, active_license_pool, edition, identifier, feed, entry
+        )
+        self.add_ratings(work, entry)
+
     @classmethod
-    def annotate_work_entry(cls, work, license_pool, edition, identifier, feed,
-                            entry):
+    def add_ratings(cls, work, entry):
         """Add a quality rating to the work.
         """
         for type_uri, value in [
@@ -351,15 +468,21 @@ class VerboseAnnotator(Annotator):
                 entry.append(cls.rating_tag(type_uri, value))
 
     @classmethod
-    def categories(cls, work):
+    def categories(cls, work, identifier_cutoff=100):
         """Send out _all_ categories for the work.
 
         (So long as the category type has a URI associated with it in
         Subject.uri_lookup.)
+
+        :param identifier_cutoff: When calculating related identifiers
+        for this work at a given level, cut off the query after
+        approximately this many results. This will improve
+        performance, at the expense of ignoring classifications for
+        identifiers that are distantly related to the work.
         """
         _db = Session.object_session(work)
         by_scheme_and_term = dict()
-        identifier_ids = work.all_identifier_ids()
+        identifier_ids = work.all_identifier_ids(cutoff=identifier_cutoff)
         classifications = Identifier.classifications_for_identifier_ids(
             _db, identifier_ids)
         for c in classifications:
@@ -385,7 +508,7 @@ class VerboseAnnotator(Annotator):
         return by_scheme
 
     @classmethod
-    def authors(cls, work, license_pool, edition, identifier):
+    def authors(cls, work, edition):
         """Create a detailed <author> tag for each author."""
         return [cls.detailed_author(author)
                 for author in edition.author_contributors]
@@ -434,41 +557,61 @@ class AcquisitionFeed(OPDSFeed):
 
     @classmethod
     def groups(cls, _db, title, url, lane, annotator,
-               cache_type=None, force_refresh=False):
+               cache_type=None, force_refresh=False, facets=None):
         """The acquisition feed for 'featured' items from a given lane's
         sublanes, organized into per-lane groups.
 
+        :param facets: A GroupsFacet object.
+
         :return: CachedFeed (if use_cache is True) or unicode
         """
-        cached = None
-        use_cache = cache_type != cls.NO_CACHE
-        if use_cache:
-            cache_type = cache_type or CachedFeed.GROUPS_TYPE
-            cached, usable = CachedFeed.fetch(
-                _db,
-                lane=lane,
-                type=cache_type,
-                facets=None,
-                pagination=None,
-                annotator=annotator,
-                force_refresh=force_refresh
-            )
-            if usable:
-                return cached
+        works_and_lanes = None
+        if lane.children:
+            # Since this lane has children, it's reasonable to at least
+            # try to create a groups feed for it.
+            if not annotator:
+                annotator = Annotator
+            if callable(annotator):
+                annotator = annotator()
+            cached = None
+            use_cache = cache_type != cls.NO_CACHE
+            facets = facets or lane.default_featured_facets(_db)
+            if use_cache:
+                cache_type = cache_type or CachedFeed.GROUPS_TYPE
+                cached, usable = CachedFeed.fetch(
+                    _db,
+                    lane=lane,
+                    type=cache_type,
+                    facets=facets,
+                    pagination=None,
+                    annotator=annotator,
+                    force_refresh=force_refresh,
+                )
+                if usable:
+                    return cached.content
+            works_and_lanes = lane.groups(_db, facets=facets)
 
-        works_and_lanes = lane.groups(_db)
         if not works_and_lanes:
-            # We did not find enough works for a groups feed.
-            # Instead we need to display a flat feed--the
-            # contents of what would have been the 'all' feed.
+            # We cannot generate a groups feed, either because we
+            # tried and did not find enough works, or because the lane
+            # has no sublanes. So we need to display a paginated feed
+            # instead.
             #
-            # Generate a page-type feed that is filed as a
-            # groups-type feed so it will show up when the client
-            # asks for it.
+            # Generate a page-type feed with a default set of facets.
+            # File it as a groups-type feed, so it will show up when
+            # the client asks for it.
+            #
+            # TODO: In theory, this lane might have multiple entry
+            # points. Since entry points are only associated with
+            # grouped feeds, the generated feed will not mention entry
+            # points.  However this is not likely to be a problem in
+            # real life.
+            cache_type = cache_type or CachedFeed.GROUPS_TYPE
             cached = cls.page(
                 _db, title, url, lane, annotator,
                 cache_type=cache_type,
                 force_refresh=force_refresh,
+                facets=None,
             )
             return cached
 
@@ -478,10 +621,10 @@ class AcquisitionFeed(OPDSFeed):
                 # We are looking at the groups feed for (e.g.)
                 # "Science Fiction", and we're seeing a book
                 # that is featured within "Science Fiction" itself
-                # rather than one of the sublanes. 
+                # rather than one of the sublanes.
                 #
                 # We want to assign this work to a group called "All
-                # Science Fiction" and point its 'group URI' to 
+                # Science Fiction" and point its 'group URI' to
                 # the linear feed of the "Science Fiction" lane
                 # (as opposed to the groups feed, which is where we
                 # are now).
@@ -505,13 +648,28 @@ class AcquisitionFeed(OPDSFeed):
         all_works = annotator.sort_works_for_groups_feed(all_works)
         feed = AcquisitionFeed(_db, title, url, all_works, annotator)
 
-        cls.add_breadcrumb_links(feed, lane, annotator)        
+        # A grouped feed may link to alternate entry points into
+        # the data.
+        entrypoints = facets.selectable_entrypoints(lane)
+        if entrypoints:
+            def make_link(ep, is_default):
+                if is_default:
+                    # No need to clutter up the URL with the default
+                    # entry point.
+                    ep = None
+                return annotator.groups_url(
+                    lane, facets=facets.navigate(entrypoint=ep)
+                )
+            cls.add_entrypoint_links(
+                feed, make_link, entrypoints, facets.entrypoint
+            )
+
+        feed.add_breadcrumb_links(lane, facets.entrypoint)
         annotator.annotate_feed(feed, lane)
 
         content = unicode(feed)
         if cached and use_cache:
             cached.update(_db, content)
-            return cached
         return content
 
     @classmethod
@@ -543,10 +701,10 @@ class AcquisitionFeed(OPDSFeed):
                 facets=facets,
                 pagination=pagination,
                 annotator=annotator,
-                force_refresh=force_refresh
+                force_refresh=force_refresh,
             )
             if usable:
-                return cached
+                return cached.content
 
         works_q = lane.works(_db, facets, pagination)
         if not works_q:
@@ -554,7 +712,24 @@ class AcquisitionFeed(OPDSFeed):
             works = []
         else:
             works = works_q.all()
+            pagination.this_page_size = len(works)
         feed = cls(_db, title, url, works, annotator)
+
+        entrypoints = facets.selectable_entrypoints(lane)
+        if entrypoints:
+            # A paginated feed may have multiple entry points into the
+            # same dataset.
+            def make_link(ep, is_default):
+                if is_default:
+                    # No need to clutter up the URL with the default
+                    # entry point.
+                    ep = None
+                return annotator.feed_url(
+                    lane, facets=facets.navigate(entrypoint=ep)
+                )
+            cls.add_entrypoint_links(
+                feed, make_link, entrypoints, facets.entrypoint
+            )
 
         # Add URLs to change faceted views of the collection.
         for args in cls.facet_links(annotator, facets):
@@ -571,20 +746,118 @@ class AcquisitionFeed(OPDSFeed):
         if previous_page:
             OPDSFeed.add_link_to_feed(feed=feed.feed, rel="previous", href=annotator.feed_url(lane, facets, previous_page))
 
-        cls.add_breadcrumb_links(feed, lane, annotator)
-        
+        feed.add_breadcrumb_links(lane, facets.entrypoint)
+
         annotator.annotate_feed(feed, lane)
 
         content = unicode(feed)
         if cached and use_cache:
             cached.update(_db, content)
-            return cached
         return content
 
     @classmethod
-    def add_breadcrumb_links(self, feed, lane, annotator):
-        # Add "up" link and breadcrumbs
+    def facet_link(cls, href, title, facet_group_name, is_active):
+        """Build a set of attributes for a facet link.
+
+        :param href: Destination of the link.
+        :param title: Human-readable description of the facet.
+        :param facet_group_name: The facet group to which the facet belongs,
+           e.g. "Sort By".
+        :param is_active: True if this is the client's currently
+           selected facet.
+
+        :return: A dictionary of attributes, suitable for passing as
+            keyword arguments into OPDSFeed.add_link_to_feed.
+        """
+        args = dict(href=href, title=title)
+        args['rel'] = cls.FACET_REL
+        args['{%s}facetGroup' % AtomFeed.OPDS_NS] = facet_group_name
+        if is_active:
+            args['{%s}activeFacet' % AtomFeed.OPDS_NS] = "true"
+        return args
+
+    @classmethod
+    def add_entrypoint_links(cls, feed, url_generator, entrypoints,
+                             selected_entrypoint, group_name='Formats'):
+        """Add links to a feed forming an OPDS facet group for a set of
+        EntryPoints.
+
+        :param feed: A lxml Tag object.
+        :param url_generator: A callable that returns the entry point
+            URL when passed an EntryPoint.
+        :param entrypoints: A list of all EntryPoints in the facet group.
+        :param selected_entrypoint: The current EntryPoint, if selected.
+        """
+        if (len(entrypoints) == 1
+            and selected_entrypoint in (None, entrypoints[0])):
+            # There is only one entry point. Unless the currently
+            # selected entry point is somehow different, there's no
+            # need to put any links at all here -- a facet group with
+            # one one facet might as well not be there.
+            return
+
+        is_default = True
+        for entrypoint in entrypoints:
+            link = cls._entrypoint_link(
+                url_generator, entrypoint, selected_entrypoint, is_default,
+                group_name
+            )
+            if link:
+                cls.add_link_to_feed(feed.feed, **link)
+                is_default = False
+
+    @classmethod
+    def _entrypoint_link(
+            cls, url_generator, entrypoint, selected_entrypoint,
+            is_default, group_name
+    ):
+        """Create arguments for add_link_to_feed for a link that navigates
+        between EntryPoints.
+        """
+        display_title = EntryPoint.DISPLAY_TITLES.get(entrypoint)
+        if not display_title:
+            # Shouldn't happen.
+            return
+
+        url = url_generator(entrypoint, is_default)
+        is_selected = entrypoint is selected_entrypoint
+        link = cls.facet_link(url, display_title, group_name, is_selected)
+
+        # Unlike a normal facet group, every link in this facet
+        # group has an additional attribute marking it as an entry
+        # point.
+        #
+        # In OPDS 2 this can become an additional rel value,
+        # removing the need for a custom attribute.
+        link['{%s}facetGroupType' % AtomFeed.SIMPLIFIED_NS] = FacetConstants.ENTRY_POINT_REL
+        return link
+
+    def add_breadcrumb_links(self, lane, entrypoint=None):
+        """Add information necessary to find your current place in the
+        site's navigation.
+
+        A link with rel="start" points to the start of the site
+
+        A <simplified:entrypoint> section describes the current entry point.
+
+        A <simplified:breadcrumbs> section contains a sequence of
+        breadcrumb links.
+        """
+        # Add the top-level link with rel='start'
+        xml = self.feed
+        annotator = self.annotator
         top_level_title = annotator.top_level_title() or "Collection Home"
+        self.add_link_to_feed(
+            feed=xml, rel='start', href=annotator.default_lane_url(),
+            title=top_level_title
+        )
+
+        # Add a link to the direct parent with rel="up".
+        #
+        # TODO: the 'direct parent' may be the same lane but without
+        # the entry point specified. Fixing this would also be a good
+        # opportunity to refactor the code for figuring out parent and
+        # parent_title.
         parent = None
         if isinstance(lane, Lane):
             parent = lane.parent
@@ -592,38 +865,62 @@ class AcquisitionFeed(OPDSFeed):
             parent_title = parent.display_name
         else:
             parent_title = top_level_title
+
         if parent:
             up_uri = annotator.lane_url(parent)
-            OPDSFeed.add_link_to_feed(feed=feed.feed, href=up_uri, rel="up", title=parent_title)
-            feed.add_breadcrumbs(lane, annotator)
+            self.add_link_to_feed(
+                feed=xml, href=up_uri, rel="up", title=parent_title
+            )
+        self.add_breadcrumbs(lane, entrypoint=entrypoint)
 
-        OPDSFeed.add_link_to_feed(feed=feed.feed, rel='start', href=annotator.default_lane_url(), title=top_level_title)
-
+        # Annotate the feed with a simplified:entryPoint for the
+        # current EntryPoint.
+        self.show_current_entrypoint(entrypoint)
 
     @classmethod
-    def search(cls, _db, title, url, lane, search_engine, query, pagination=None,
-               annotator=None
+    def search(cls, _db, title, url, lane, search_engine, query, media=None, pagination=None,
+               annotator=None, languages=None, facets=None
     ):
+        facets = facets or SearchFacets()
+        pagination = pagination or Pagination.default()
         results = lane.search(
-            _db, query, search_engine, pagination=pagination
+            _db, query, search_engine, media, pagination=pagination, languages=languages, facets=facets
         )
         opds_feed = AcquisitionFeed(_db, title, url, results, annotator=annotator)
         AcquisitionFeed.add_link_to_feed(feed=opds_feed.feed, rel='start', href=annotator.default_lane_url(), title=annotator.top_level_title())
 
+        # A feed of search results may link to alternate entry points
+        # into those results.
+        entrypoints = facets.selectable_entrypoints(lane)
+        if entrypoints:
+            def make_link(ep, is_default):
+                if is_default:
+                    ep = None
+                return annotator.search_url(
+                    lane, query, pagination=None,
+                    facets=facets.navigate(entrypoint=ep)
+                )
+            cls.add_entrypoint_links(
+                opds_feed, make_link, entrypoints, facets.entrypoint
+            )
+
         if len(results) > 0:
             # There are works in this list. Add a 'next' link.
-            AcquisitionFeed.add_link_to_feed(feed=opds_feed.feed, rel="next", href=annotator.search_url(lane, query, pagination.next_page))
+            next_url = annotator.search_url(lane, query, pagination.next_page, facets)
+            AcquisitionFeed.add_link_to_feed(feed=opds_feed.feed, rel="next", href=next_url)
 
         if pagination.offset > 0:
-            AcquisitionFeed.add_link_to_feed(feed=opds_feed.feed, rel="first", href=annotator.search_url(lane, query, pagination.first_page))
+            first_url = annotator.search_url(lane, query, pagination.first_page, facets)
+            AcquisitionFeed.add_link_to_feed(feed=opds_feed.feed, rel="first", href=first_url)
 
         previous_page = pagination.previous_page
         if previous_page:
-            AcquisitionFeed.add_link_to_feed(feed=opds_feed.feed, rel="previous", href=annotator.search_url(lane, query, previous_page))
+            previous_url = annotator.search_url(lane, query, previous_page, facets)
+            AcquisitionFeed.add_link_to_feed(feed=opds_feed.feed, rel="previous", href=previous_url)
 
         # Add "up" link and breadcrumbs
-        AcquisitionFeed.add_link_to_feed(feed=opds_feed.feed, rel="up", href=annotator.lane_url(lane), title=str(lane.display_name))
-        opds_feed.add_breadcrumbs(lane, annotator, include_lane=True)
+        AcquisitionFeed.add_link_to_feed(feed=opds_feed.feed, rel="up", href=annotator.lane_url(lane), title=unicode(lane.display_name))
+        opds_feed.add_breadcrumbs(lane, include_lane=True)
 
         annotator.annotate_feed(opds_feed, lane)
         return unicode(opds_feed)
@@ -660,19 +957,22 @@ class AcquisitionFeed(OPDSFeed):
         return OPDSMessage(identifier.urn, error_status, error_message)
 
     @classmethod
-    def facet_links(self, annotator, facets):
+    def facet_links(cls, annotator, facets):
+        """Create links for this feed's navigational facet groups.
+
+        This does not create links for the entry point facet group,
+        because those links should only be present in certain
+        circumstances, and this method doesn't know if those
+        circumstances apply. You need to decide whether to call
+        add_entrypoint_links in addition to calling this method.
+        """
         for group, value, new_facets, selected, in facets.facet_groups:
             url = annotator.facet_url(new_facets)
             if not url:
                 continue
             group_title = str(Facets.GROUP_DISPLAY_TITLES[group])
             facet_title = str(Facets.FACET_DISPLAY_TITLES[value])
-            link = dict(href=url, title=facet_title)
-            link['rel'] = self.FACET_REL
-            link['{%s}facetGroup' % AtomFeed.OPDS_NS] = group_title
-            if selected:
-                link['{%s}activeFacet' % AtomFeed.OPDS_NS] = "true"
-            yield link
+            yield cls.facet_link(url, facet_title, group_title, selected)
 
     CACHE_FOREVER = 'forever'
 
@@ -681,7 +981,7 @@ class AcquisitionFeed(OPDSFeed):
 
     GROUPED_MAX_AGE_POLICY = Configuration.GROUPED_MAX_AGE_POLICY
     DEFAULT_GROUPED_MAX_AGE = CACHE_FOREVER
-            
+
     @classmethod
     def grouped_max_age(cls, _db):
         "The maximum cache time for a grouped acquisition feed."
@@ -704,14 +1004,16 @@ class AcquisitionFeed(OPDSFeed):
         if value is None:
             value = cls.DEFAULT_NONGROUPED_MAX_AGE
         return value
-            
+
     def __init__(self, _db, title, url, works, annotator=None,
                  precomposed_entries=[]):
         """Turn a list of works, messages, and precomposed <opds> entries
         into a feed.
         """
         if not annotator:
-            annotator = Annotator()
+            annotator = Annotator
+        if callable(annotator):
+            annotator = annotator()
         self.annotator = annotator
 
         super(AcquisitionFeed, self).__init__(title, url)
@@ -785,15 +1087,17 @@ class AcquisitionFeed(OPDSFeed):
             )
 
         try:
-            return self._create_entry(work, active_license_pool, active_edition,
-                                      identifier, force_create, use_cache)
+            return self._create_entry(
+                work, active_license_pool, active_edition, identifier,
+                force_create, use_cache
+            )
         except UnfulfillableWork, e:
             logging.info(
                 "Work %r is not fulfillable, refusing to create an <entry>.",
                 work,
             )
             return self.error_message(
-                identifier, 
+                identifier,
                 403,
                 "I know about this work but can offer no way of fulfilling it."
             )
@@ -804,8 +1108,30 @@ class AcquisitionFeed(OPDSFeed):
             )
             return None
 
-    def _create_entry(self, work, license_pool, edition, identifier,
-                      force_create=False, use_cache=True):
+    def _create_entry(self, work, active_license_pool, edition,
+                      identifier, force_create=False, use_cache=True):
+        """Build a complete OPDS entry for the given Work.
+
+        The OPDS entry will contain bibliographic information about
+        the Work, as well as information derived from a specific
+        LicensePool and Identifier associated with the Work.
+
+        :param work: The Work whose OPDS entry the client is interested in.
+        :active_license_pool: Of all the LicensePools associated with this
+           Work, the client has expressed interest in this one.
+        :param edition: The edition to use as the presentation edition
+            when creating the entry. If this is not present, the work's
+            existing presentation edition will be used.
+        :identifier: Of all the Identifiers associated with this
+           Work, the client has expressed interest in this one.
+        :param force_create: Create this entry even if there's already
+            a cached one.
+        :param use_cache: If true, a newly created entry will be cached
+            in the appropriate storage field of Work -- either
+            simple_opds_entry or verbose_opds_entry. (NOTE: this has some
+            overlap with force_create which is difficult to explain.)
+        :return: An lxml Element object
+        """
         xml = None
         field = self.annotator.opds_cache_field
         if field and work and not force_create and use_cache:
@@ -817,26 +1143,32 @@ class AcquisitionFeed(OPDSFeed):
             if isinstance(work, BaseMaterializedWork):
                 raise Exception(
                     "Cannot build an OPDS entry for a MaterializedWork.")
-            xml = self._make_entry_xml(work, license_pool, edition, identifier)
+            xml = self._make_entry_xml(work, edition)
             data = etree.tostring(xml)
             if field and use_cache:
                 setattr(work, field, data)
 
+        # Now add the stuff specific to the selected Identifier
+        # and LicensePool.
         self.annotator.annotate_work_entry(
-            work, license_pool, edition, identifier, self, xml)
-            
-        group_uri, group_title = self.annotator.group_uri(
-            work, license_pool, identifier)
-        if group_uri:
-            self.add_link_to_entry(
-                xml, rel=OPDSFeed.GROUP_REL, href=group_uri,
-                title=group_title)
+            work, active_license_pool, edition, identifier, self, xml)
 
         return xml
 
-    def _make_entry_xml(self, work, license_pool, edition, identifier):
+    def _make_entry_xml(self, work, edition):
+        """Create a new (incomplete) OPDS entry for the given work.
 
-        if work and not edition:
+        It will be completed later, in an application-specific way,
+        in annotate_work_entry().
+
+        :param work: The Work that needs an OPDS entry.
+        :param edition: The edition to use as the presentation edition
+            when creating the entry.
+        """
+        if not work:
+            return None
+
+        if not edition:
             edition = work.presentation_edition
 
         # Find the .epub link
@@ -855,15 +1187,20 @@ class AcquisitionFeed(OPDSFeed):
                 (Hyperlink.IMAGE, full_urls),
                 (Hyperlink.THUMBNAIL_IMAGE, thumbnail_urls)):
             for url in urls:
+                # TODO: This is suboptimal. We know the media types
+                # associated with these URLs when they are
+                # Representations, but we don't have a way to connect
+                # the cover_full_url with the corresponding
+                # Representation, and performance considerations make
+                # it impractical to follow the object reference every
+                # time.
                 image_type = "image/png"
                 if url.endswith(".jpeg") or url.endswith(".jpg"):
                     image_type = "image/jpeg"
                 elif url.endswith(".gif"):
                     image_type = "image/gif"
                 links.append(AtomFeed.link(rel=rel, href=url, type=image_type))
-           
 
-        permalink = self.annotator.permalink_for(work, license_pool, identifier)
         content = self.annotator.content(work)
         if isinstance(content, str):
             content = content.decode("utf8")
@@ -880,7 +1217,6 @@ class AcquisitionFeed(OPDSFeed):
             kw[additional_type_field] = additional_type
 
         entry = AtomFeed.entry(
-            AtomFeed.id(permalink),
             AtomFeed.title(edition.title or OPDSFeed.NO_TITLE),
             **kw
         )
@@ -889,7 +1225,7 @@ class AcquisitionFeed(OPDSFeed):
             subtitle_tag.text = edition.subtitle
             entry.append(subtitle_tag)
 
-        author_tags = self.annotator.authors(work, license_pool, edition, identifier)
+        author_tags = self.annotator.authors(work, edition)
         entry.extend(author_tags)
 
         if edition.series:
@@ -898,9 +1234,6 @@ class AcquisitionFeed(OPDSFeed):
         if content:
             entry.extend([AtomFeed.summary(content, type=content_type)])
 
-        entry.extend([
-            AtomFeed.updated(AtomFeed._strftime(datetime.datetime.utcnow())),
-        ])
 
         permanent_work_id_tag = AtomFeed.makeelement("{%s}pwid" % AtomFeed.SIMPLIFIED_NS)
         permanent_work_id_tag.text = edition.permanent_work_id
@@ -931,44 +1264,38 @@ class AcquisitionFeed(OPDSFeed):
             publisher_tag.text = edition.publisher
             entry.extend([publisher_tag])
 
-        # We use Atom 'published' for the date the book first became
-        # available to people using this application.
-        now = datetime.datetime.utcnow()
-        today = datetime.date.today()
-        if license_pool and license_pool.availability_time:
-            avail = license_pool.availability_time
-            if isinstance(avail, datetime.datetime):
-                avail = avail.date()
-            if avail <= today:
-                availability_tag = AtomFeed.makeelement("published")
-                # TODO: convert to local timezone.
-                availability_tag.text = AtomFeed._strftime(license_pool.availability_time)
-                entry.extend([availability_tag])
+        if edition.imprint:
+            imprint_tag = AtomFeed.makeelement("{%s}publisherImprint" % AtomFeed.BIB_SCHEMA_NS)
+            imprint_tag.text = edition.imprint
+            entry.extend([imprint_tag])
 
         # Entry.issued is the date the ebook came out, as distinct
         # from Entry.published (which may refer to the print edition
         # or some original edition way back when).
         #
-        # For Dublin Core 'created' we use Entry.issued if we have it
+        # For Dublin Core 'issued' we use Entry.issued if we have it
         # and Entry.published if not. In general this means we use
         # issued date for Gutenberg and published date for other
         # sources.
         #
-        # We use dc:created instead of dc:issued because dc:issued is
-        # commonly conflated with atom:published.
-        #
         # For the date the book was added to our collection we use
         # atom:published.
+        #
+        # Note: feedparser conflates dc:issued and atom:published, so
+        # it can't be used to extract this information. However, these
+        # tags are consistent with the OPDS spec.
         issued = edition.issued or edition.published
-        if (isinstance(issued, datetime.datetime) 
+        if (isinstance(issued, datetime.datetime)
             or isinstance(issued, datetime.date)):
+            now = datetime.datetime.utcnow()
+            today = datetime.date.today()
             issued_already = False
             if isinstance(issued, datetime.datetime):
                 issued_already = (issued <= now)
             elif isinstance(issued, datetime.date):
                 issued_already = (issued <= today)
             if issued_already:
-                issued_tag = AtomFeed.makeelement("{%s}created" % AtomFeed.DCTERMS_NS)
+                issued_tag = AtomFeed.makeelement("{%s}issued" % AtomFeed.DCTERMS_NS)
                 # Use datetime.isoformat instead of datetime.strftime because
                 # strftime only works on dates after 1890, and we have works
                 # that were issued much earlier than that.
@@ -978,9 +1305,36 @@ class AcquisitionFeed(OPDSFeed):
 
         return entry
 
-    def add_breadcrumbs(self, lane, annotator, include_lane=False):
-        """Add list of ancestor links in a breadcrumbs element."""
+
+    CURRENT_ENTRYPOINT_ATTRIBUTE = "{%s}entryPoint" % AtomFeed.SIMPLIFIED_NS
+
+    def show_current_entrypoint(self, entrypoint):
+        """Annotate this given feed with a simplified:entryPoint
+        attribute pointing to the current entrypoint's TYPE_URI.
+
+        This gives clients an overall picture of the type of works in
+        the feed, and a way to distinguish between one EntryPoint
+        and another.
+
+        :param entrypoint: An EntryPoint.
+        """
+        if not entrypoint:
+            return
+
+        if not entrypoint.URI:
+            return
+        self.feed.attrib[self.CURRENT_ENTRYPOINT_ATTRIBUTE] = entrypoint.URI
+
+    def add_breadcrumbs(self, lane, include_lane=False, entrypoint=None):
+        """Add list of ancestor links in a breadcrumbs element.
+
+        TODO: The switchover from "no entry point" to "entry point" needs
+        its own breadcrumb link.
+        """
         # Ensure that lane isn't top-level before proceeding
+
+        entrypointQuery = ("?entrypoint=" + entrypoint.INTERNAL_NAME) if entrypoint != None else ""
+        annotator = self.annotator
         if annotator.lane_url(lane) != annotator.default_lane_url():
             breadcrumbs = AtomFeed.makeelement("{%s}breadcrumbs" % AtomFeed.SIMPLIFIED_NS)
 
@@ -989,20 +1343,25 @@ class AcquisitionFeed(OPDSFeed):
             breadcrumbs.append(
                 AtomFeed.link(title=annotator.top_level_title(), href=root_url)
             )
-            
+
+            if entrypoint:
+                breadcrumbs.append(
+                    AtomFeed.link(title=entrypoint.INTERNAL_NAME, href=root_url + entrypointQuery)
+                )
+
             # Add links for all visible ancestors that aren't root
             for ancestor in reversed(list(lane.parentage)):
                 lane_url = annotator.lane_url(ancestor)
                 if lane_url != root_url:
                     breadcrumbs.append(
-                        AtomFeed.link(title=ancestor.display_name, href=lane_url)
+                        AtomFeed.link(title=ancestor.display_name, href=lane_url + entrypointQuery)
                     )
 
             # Include link to lane
             # For search, breadcrumbs include the searched lane
             if include_lane:
                 breadcrumbs.append(
-                    AtomFeed.link(title=lane.display_name, href=annotator.lane_url(lane))
+                    AtomFeed.link(title=lane.display_name, href=annotator.lane_url(lane) + entrypointQuery)
                 )
 
             self.feed.append(breadcrumbs)
@@ -1013,19 +1372,18 @@ class AcquisitionFeed(OPDSFeed):
     ):
         elements = []
         representations = []
-        most_recent_update = None
         if cover:
             cover_representation = cover.representation
             representations.append(cover.representation)
             cover_link = AtomFeed.makeelement(
-                "link", href=cover_representation.mirror_url,
+                "link", href=cover_representation.public_url,
                 type=cover_representation.media_type, rel=Hyperlink.IMAGE)
             elements.append(cover_link)
             if cover_representation.thumbnails:
                 thumbnail = cover_representation.thumbnails[0]
                 representations.append(thumbnail)
                 thumbnail_link = AtomFeed.makeelement(
-                    "link", href=thumbnail.mirror_url,
+                    "link", href=thumbnail.public_url,
                     type=thumbnail.media_type,
                     rel=Hyperlink.THUMBNAIL_IMAGE
                 )
@@ -1067,7 +1425,7 @@ class AcquisitionFeed(OPDSFeed):
 
     @classmethod
     def acquisition_link(cls, rel, href, types):
-        if types:            
+        if types:
             initial_type = types[0]
             indirect_types = types[1:]
         else:
@@ -1113,9 +1471,8 @@ class AcquisitionFeed(OPDSFeed):
                 obj = loan
             elif hold:
                 obj = hold
-            library = obj.patron.library
             default_loan_period = datetime.timedelta(
-                collection.default_loan_period(library)
+                collection.default_loan_period(obj.library or obj.integration_client)
             )
         if loan:
             status = 'available'
@@ -1155,9 +1512,34 @@ class AcquisitionFeed(OPDSFeed):
             return tags
 
 
-        holds_kw = dict(total=str(license_pool.patrons_in_hold_queue or 0))
-        if hold and hold.position:
-            holds_kw['position'] = str(hold.position)
+        holds_kw = dict()
+        total = license_pool.patrons_in_hold_queue or 0
+
+        if hold:
+            if hold.position is None:
+                # This shouldn't happen, but if it does, assume we're last
+                # in the list.
+                position = total
+            else:
+                position = hold.position
+
+            if position > 0:
+                holds_kw['position'] = str(position)
+            if position > total:
+                # The patron's hold position appears larger than the total
+                # number of holds. This happens frequently because the
+                # number of holds and a given patron's hold position are
+                # updated by different processes. Don't propagate this
+                # appearance to the client.
+                total = position
+            elif position == 0 and total == 0:
+                # The book is reserved for this patron but they're not
+                # counted as having it on hold. This is the only case
+                # where we know that the total number of holds is
+                # *greater* than the hold position.
+                total = 1
+        holds_kw['total'] = str(total)
+
         holds = AtomFeed.makeelement("{%s}holds" % AtomFeed.OPDS_NS, **holds_kw)
         tags.append(holds)
 
@@ -1206,20 +1588,15 @@ class LookupAcquisitionFeed(AcquisitionFeed):
         """
         identifier, work = work
 
-        # Most of the time we can use the cached OPDS entry for the
-        # Work. However, that cached OPDS feed is designed around one
-        # specific LicensePool, and it's possible that the client is
-        # asking for a lookup centered around a different edition of the
-        # same book.
-        default_licensepool = self.annotator.active_licensepool_for(work)
+        # Unless the client is asking for something impossible
+        # (e.g. the Identifier is not really associated with the
+        # Work), we should be able to use the cached OPDS entry for
+        # the Work.
         if identifier.licensed_through:
             active_licensepool = identifier.licensed_through[0]
         else:
-            active_licensepool = default_licensepool
-
-        # In that case, we can't use the cached OPDS entry. We need to
-        # create a new one (and not store it in the cache).
-        use_cache = (active_licensepool == default_licensepool)
+            # Use the default active LicensePool for the Work.
+            active_licensepool = self.annotator.active_licensepool_for(work)
 
         error_status = error_message = None
         if not active_licensepool:
@@ -1228,7 +1605,7 @@ class LookupAcquisitionFeed(AcquisitionFeed):
         elif identifier.work != work:
             error_status = 500
             error_message = 'I tried to generate an OPDS entry for the identifier "%s" using a Work not associated with that identifier.' % identifier.urn
-           
+
         if error_status:
             return self.error_message(identifier, error_status, error_message)
 
@@ -1238,8 +1615,7 @@ class LookupAcquisitionFeed(AcquisitionFeed):
             edition = work.presentation_edition
         try:
             return self._create_entry(
-                work, active_licensepool, edition, identifier,
-                use_cache=use_cache
+                work, active_licensepool, edition, identifier
             )
         except UnfulfillableWork, e:
             logging.info(
@@ -1283,7 +1659,7 @@ class TestAnnotator(Annotator):
         return base
 
     @classmethod
-    def search_url(cls, lane, query, pagination):
+    def search_url(cls, lane, query, pagination, facets=None):
         if isinstance(lane, Lane):
             base = "http://%s/" % lane.url_name
         else:
@@ -1291,15 +1667,25 @@ class TestAnnotator(Annotator):
         sep = '?'
         if pagination:
             base += sep + pagination.query_string
+            sep = '&'
+        if facets:
+            facet_query_string = facets.query_string
+            if facet_query_string:
+                base += sep + facet_query_string
         return base
 
     @classmethod
-    def groups_url(cls, lane):
+    def groups_url(cls, lane, facets=None):
         if lane and isinstance(lane, Lane):
             identifier = lane.id
         else:
             identifier = ""
-        return "http://groups/%s" % identifier
+        if facets:
+            facet_string = '?' + facets.query_string
+        else:
+            facet_string = ''
+
+        return "http://groups/%s%s" % (identifier, facet_string)
 
     @classmethod
     def default_lane_url(cls):
@@ -1327,13 +1713,18 @@ class TestAnnotatorWithGroup(TestAnnotator):
             if additional_lanes:
                 self.lanes_by_work[work] = additional_lanes
         else:
-            lane_name = str(work.id)
+            if isinstance(work, Work):
+                work_id = work.id
+            else:
+                # MaterialivedWorkWithGenre
+                work_id = work.works_id
+            lane_name = str(work_id)
         return ("http://group/%s" % lane_name,
                 "Group Title for %s!" % lane_name)
 
     def group_uri_for_lane(self, lane):
         if lane:
-            return ("http://groups/%s" % lane.display_name, 
+            return ("http://groups/%s" % lane.display_name,
                     "Groups of %s" % lane.display_name)
         else:
             return "http://groups/", "Top-level groups"
@@ -1345,6 +1736,5 @@ class TestAnnotatorWithGroup(TestAnnotator):
 class TestUnfulfillableAnnotator(TestAnnotator):
     """Raise an UnfulfillableWork exception when asked to annotate an entry."""
 
-    @classmethod
     def annotate_work_entry(self, *args, **kwargs):
         raise UnfulfillableWork()

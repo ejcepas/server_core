@@ -8,6 +8,7 @@ import logging
 import urlparse
 import urllib
 import sys
+
 from sqlalchemy.orm.exc import (
     NoResultFound,
 )
@@ -63,12 +64,16 @@ from util.http import (
     HTTP,
     BadResponseException,
 )
+from util.worker_pools import RLock
 
 from testing import MockRequestsResponse
 
 class OverdriveAPI(object):
 
     log = logging.getLogger("Overdrive API")
+
+    # A lock for threaded usage.
+    lock = RLock()
 
     TOKEN_ENDPOINT = "https://oauth.overdrive.com/token"
     PATRON_TOKEN_ENDPOINT = "https://oauth-patron.overdrive.com/patrontoken"
@@ -192,15 +197,15 @@ class OverdriveAPI(object):
 
     def check_creds(self, force_refresh=False):
         """If the Bearer Token has expired, update it."""
-        if force_refresh:
-            refresh_on_lookup = lambda x: x
-        else:
+        with self.lock:
             refresh_on_lookup = self.refresh_creds
+            if force_refresh:
+                refresh_on_lookup = lambda x: x
 
-        credential = self.credential_object(refresh_on_lookup)
-        if force_refresh:
-            self.refresh_creds(credential)
-        self.token = credential.credential
+            credential = self.credential_object(refresh_on_lookup)
+            if force_refresh:
+                self.refresh_creds(credential)
+            self.token = credential.credential
 
     def credential_object(self, refresh):
         """Look up the Credential object that allows us to use
@@ -280,11 +285,12 @@ class OverdriveAPI(object):
         a link to the titles in the collection.
         """
         url = self._library_endpoint
-        representation, cached = Representation.get(
-            self._db, url, self.get, 
-            exception_handler=Representation.reraise_exception,
-        )
-        return json.loads(representation.content)
+        with self.lock:
+            representation, cached = Representation.get(
+                self._db, url, self.get,
+                exception_handler=Representation.reraise_exception,
+            )
+            return json.loads(representation.content)
 
     def get_advantage_accounts(self):
         """Find all the Overdrive Advantage accounts managed by this library.
@@ -314,10 +320,7 @@ class OverdriveAPI(object):
         """Get IDs for every book in the system, with the most recently added
         ones at the front.
         """
-        params = dict(collection_token=self.collection_token,
-                      sort="dateAdded:desc")
-        next_link = self.make_link_safe(
-            self.ALL_PRODUCTS_ENDPOINT % params)
+        next_link = self._all_products_link
         while next_link:
             page_inventory, next_link = self._get_book_list_page(
                 next_link, 'next'
@@ -325,6 +328,12 @@ class OverdriveAPI(object):
 
             for i in page_inventory:
                 yield i
+
+    @property
+    def _all_products_link(self):
+        params = dict(collection_token=self.collection_token,
+                      sort="dateAdded:desc")
+        return self.make_link_safe(self.ALL_PRODUCTS_ENDPOINT % params)
 
     def _get_book_list_page(self, link, rel_to_follow='next'):
         """Process a page of inventory whose circulation we need to check.
@@ -1114,4 +1123,11 @@ class OverdriveBibliographicCoverageProvider(BibliographicCoverageProvider):
             e = "Could not extract metadata from Overdrive data: %r" % info
             return self.failure(identifier, e)
 
+        self.metadata_pre_hook(metadata)
         return self.set_metadata(identifier, metadata)
+
+    def metadata_pre_hook(self, metadata):
+        """A hook method that allows subclasses to modify a Metadata
+        object derived from Overdrive before it's applied.
+        """
+        return metadata

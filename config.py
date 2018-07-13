@@ -5,15 +5,32 @@ import os
 import json
 import logging
 import copy
-from util import LanguageCodes
 from sqlalchemy.engine.url import make_url
 from flask_babel import lazy_gettext as _
 
 from facets import FacetConstants
+from entrypoint import EntryPoint
+
 from sqlalchemy.exc import ArgumentError
 
-class CannotLoadConfiguration(Exception):
+from util import LanguageCodes
+
+# It's convenient for other modules import IntegrationException
+# from this module, alongside CannotLoadConfiguration.
+from util.http import IntegrationException
+
+
+class CannotLoadConfiguration(IntegrationException):
+    """The current configuration of an external integration, or of the
+    site as a whole, is in an incomplete or inconsistent state.
+
+    This is more specific than a base IntegrationException because it
+    assumes the problem is evident just by looking at the current
+    configuration, with no need to actually talk to the foreign
+    server.
+    """
     pass
+
 
 @contextlib.contextmanager
 def temp_config(new_config=None, replacement_classes=None):
@@ -45,6 +62,11 @@ class Configuration(object):
     DATABASE_TEST_ENVIRONMENT_VARIABLE = 'SIMPLIFIED_TEST_DATABASE'
     DATABASE_PRODUCTION_ENVIRONMENT_VARIABLE = 'SIMPLIFIED_PRODUCTION_DATABASE'
 
+    # The version of the app.
+    APP_VERSION = 'app_version'
+    VERSION_FILENAME = '.version'
+    NO_APP_VERSION_FOUND = object()
+
     # Logging stuff
     LOGGING_LEVEL = "level"
     LOGGING_FORMAT = "format"
@@ -65,7 +87,6 @@ class Configuration(object):
 
     # Policies, mostly circulation specific
     POLICIES = "policies"
-   
     LANES_POLICY = "lanes"
 
     # Lane policies
@@ -98,8 +119,8 @@ class Configuration(object):
 
     # The names of the site-wide configuration settings that determine
     # feed cache time.
-    NONGROUPED_MAX_AGE_POLICY = "default_nongrouped_feed_max_age" 
-    GROUPED_MAX_AGE_POLICY = "default_grouped_feed_max_age" 
+    NONGROUPED_MAX_AGE_POLICY = "default_nongrouped_feed_max_age"
+    GROUPED_MAX_AGE_POLICY = "default_grouped_feed_max_age"
 
     # The name of the per-library configuration policy that controls whether
     # books may be put on hold.
@@ -125,7 +146,27 @@ class Configuration(object):
     EXTERNAL_TYPE_REGULAR_EXPRESSION = 'external_type_regular_expression'
 
     WEBSITE_URL = u'website'
-    
+
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARN = "WARN"
+    ERROR = "ERROR"
+
+    # The default value to put into the 'app' field of JSON-format logs,
+    # unless LOG_APP_NAME overrides it.
+    DEFAULT_APP_NAME = 'simplified'
+
+    # Settings for the integration with protocol=INTERNAL_LOGGING
+    LOG_LEVEL = 'log_level'
+    LOG_APP_NAME = 'log_app'
+    DATABASE_LOG_LEVEL = 'database_log_level'
+    LOG_LEVEL_UI = [
+        { "key": DEBUG, "label": _("Debug") },
+        { "key": INFO, "label": _("Info") },
+        { "key": WARN, "label": _("Warn") },
+        { "key": ERROR, "label": _("Error") },
+    ]
+
     SITEWIDE_SETTINGS = [
         {
             "key": NONGROUPED_MAX_AGE_POLICY,
@@ -138,6 +179,21 @@ class Configuration(object):
         {
             "key": BASE_URL_KEY,
             "label": _("Base url of the application"),
+        },
+        {
+            "key": LOG_LEVEL, "label": _("Log Level"), "type": "select",
+            "options": LOG_LEVEL_UI, "default": INFO,
+        },
+        {
+            "key": LOG_APP_NAME, "label": _("Application name"),
+            "description": _("Log messages originating from this application will be tagged with this name. If you run multiple instances, giving each one a different application name will help you determine which instance is having problems."),
+            "default": DEFAULT_APP_NAME,
+        },
+        {
+            "key": DATABASE_LOG_LEVEL, "label": _("Database Log Level"),
+            "type": "select", "options": LOG_LEVEL_UI,
+            "description": _("Database logs are extremely verbose, so unless you're diagnosing a database-related problem, it's a good idea to set a higher log level for database messages."),
+            "default": WARN,
         },
     ]
 
@@ -156,6 +212,17 @@ class Configuration(object):
                 { "key": "false", "label": _("Disable holds") },
             ],
             "default": "true",
+        },
+        { "key": EntryPoint.ENABLED_SETTING,
+          "label": _("Enabled entry points"),
+          "description": _("Patrons will see the selected entry points at the top level and in search results."),
+          "type": "list",
+          "options": [
+              { "key": entrypoint.INTERNAL_NAME,
+                "label": EntryPoint.DISPLAY_TITLES.get(entrypoint) }
+              for entrypoint in EntryPoint.ENTRY_POINTS
+          ],
+          "default": [x.INTERNAL_NAME for x in EntryPoint.DEFAULT_ENABLED],
         },
         {
             "key": FEATURED_LANE_SIZE,
@@ -201,7 +268,7 @@ class Configuration(object):
         return cls.instance and cls.instance.get(
             cls.LOADED_FROM_DATABASE, False
         )
-    
+
     # General getters
 
     @classmethod
@@ -271,8 +338,8 @@ class Configuration(object):
         """Find the database URL configured for this site.
 
         For compatibility with old configurations, we will look in the
-        site configuration first. 
-        
+        site configuration first.
+
         If it's not there, we will look in the appropriate environment
         variable.
         """
@@ -316,6 +383,28 @@ class Configuration(object):
         return url
 
     @classmethod
+    def app_version(cls):
+        """Returns the git version of the app, if a .version file exists."""
+        if cls.instance == None:
+            return
+
+        version = cls.get(cls.APP_VERSION, None)
+        if version:
+            # The version has been set in Configuration before.
+            return version
+
+        root_dir = os.path.join(os.path.split(__file__)[0], "..")
+        version_file = os.path.join(root_dir, cls.VERSION_FILENAME)
+
+        version = cls.NO_APP_VERSION_FOUND
+        if os.path.exists(version_file):
+            with open(version_file) as f:
+                version = f.readline().strip() or version
+
+        cls.instance[cls.APP_VERSION] = version
+        return version
+
+    @classmethod
     def data_directory(cls):
         return cls.get(cls.DATA_DIRECTORY)
 
@@ -350,7 +439,7 @@ class Configuration(object):
     # The name of the service associated with a Timestamp that tracks
     # the last time the site's configuration changed in the database.
     SITE_CONFIGURATION_CHANGED = "Site Configuration Changed"
-            
+
     @classmethod
     def last_checked_for_site_configuration_update(cls):
         """When was the last time we actually checked when the database
@@ -365,7 +454,7 @@ class Configuration(object):
                                        timeout=None):
         """Check when the site configuration was last updated.
 
-        Updates Configuration.instance[Configuration.SITE_CONFIGURATION_LAST_UPDATE]. 
+        Updates Configuration.instance[Configuration.SITE_CONFIGURATION_LAST_UPDATE].
         It's the application's responsibility to periodically check
         this value and reload the configuration if appropriate.
 
@@ -399,7 +488,7 @@ class Configuration(object):
             # We went to the database less than [timeout] seconds ago.
             # Assume there has been no change.
             return cls._site_configuration_last_update()
-        
+
         # Ask the database when was the last time the site
         # configuration changed. Specifically, this is the last time
         # site_configuration_was_changed() (defined in model.py) was
@@ -417,7 +506,7 @@ class Configuration(object):
 
         # Update the Configuration object's record of the last update time.
         cls.instance[cls.SITE_CONFIGURATION_LAST_UPDATE] = last_update
-        
+
         # Whether that record changed or not, the time at which we
         # _checked_ is going to be set to the current time.
         cls.instance[cls.LAST_CHECKED_FOR_SITE_CONFIGURATION_UPDATE] = now
@@ -430,7 +519,7 @@ class Configuration(object):
         without any attempt to find a fresher value from the database.
         """
         return cls.instance.get(cls.SITE_CONFIGURATION_LAST_UPDATE, None)
-    
+
     @classmethod
     def load(cls, _db=None):
         """Load additional site configuration from a config file.
@@ -453,6 +542,7 @@ class Configuration(object):
             configuration = cls._load('{}')
         cls.instance = configuration
 
+        cls.app_version()
         if _db:
             cls.load_cdns(_db)
             cls.instance[cls.LOADED_FROM_DATABASE] = True
@@ -463,9 +553,9 @@ class Configuration(object):
             if not cls.integration('CDN'):
                 cls.instance.setdefault(cls.INTEGRATIONS, {})[
                     'CDN'] = cls.UNINITIALIZED_CDNS
-                
+
         return configuration
-    
+
     @classmethod
     def _load(cls, str):
         lines = [x for x in str.split("\n")

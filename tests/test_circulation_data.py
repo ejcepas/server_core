@@ -34,7 +34,7 @@ from . import (
     DummyHTTPClient,
 )
 
-from s3 import DummyS3Uploader
+from s3 import MockS3Uploader
 
 
 class TestCirculationData(DatabaseTest):
@@ -202,7 +202,7 @@ class TestCirculationData(DatabaseTest):
         replacement_policy = ReplacementPolicy(formats=False)
         circulation_data.apply(self._db, pool.collection, replacement_policy)
         
-        eq_(2, pool.delivery_mechanisms.count())
+        eq_(2, len(pool.delivery_mechanisms))
         eq_(set([Representation.PDF_MEDIA_TYPE, Representation.EPUB_MEDIA_TYPE]),
             set([lpdm.delivery_mechanism.content_type for lpdm in pool.delivery_mechanisms]))
         eq_(old_lpdm, loan.fulfillment)
@@ -212,7 +212,7 @@ class TestCirculationData(DatabaseTest):
         replacement_policy = ReplacementPolicy(formats=True)
         circulation_data.apply(self._db, pool.collection, replacement_policy)
 
-        eq_(1, pool.delivery_mechanisms.count())
+        eq_(1, len(pool.delivery_mechanisms))
         eq_(Representation.EPUB_MEDIA_TYPE, pool.delivery_mechanisms[0].delivery_mechanism.content_type)
         eq_(None, loan.fulfillment)
         
@@ -294,7 +294,7 @@ class TestCirculationData(DatabaseTest):
         circulation_data.apply(self._db, pool.collection, replace)
 
         # Now we have no formats at all.
-        eq_(0, pool.delivery_mechanisms.count())
+        eq_(0, len(pool.delivery_mechanisms))
 
     def test_rights_status_default_rights_passed_in(self):
         identifier = IdentifierData(
@@ -323,7 +323,7 @@ class TestCirculationData(DatabaseTest):
         )
         circulation_data.apply(self._db, pool.collection, replace)
         eq_(True, pool.open_access)
-        eq_(1, pool.delivery_mechanisms.count())
+        eq_(1, len(pool.delivery_mechanisms))
         # The rights status is the one that was passed in to CirculationData.
         eq_(RightsStatus.CC_BY, pool.delivery_mechanisms[0].rights_status.uri)
 
@@ -359,7 +359,7 @@ class TestCirculationData(DatabaseTest):
         # The pool became open-access because it was given a
         # link that came from the OS content server.
         eq_(True, pool.open_access)
-        eq_(1, pool.delivery_mechanisms.count())
+        eq_(1, len(pool.delivery_mechanisms))
         # The rights status is the default for the OA content server.
         eq_(RightsStatus.GENERIC_OPEN_ACCESS, pool.delivery_mechanisms[0].rights_status.uri)
 
@@ -394,7 +394,7 @@ class TestCirculationData(DatabaseTest):
         # open-access.
         circulation_data.apply(self._db, pool.collection, replace_formats)
         eq_(True, pool.open_access)
-        eq_(1, pool.delivery_mechanisms.count())
+        eq_(1, len(pool.delivery_mechanisms))
 
         # The delivery mechanism's rights status is the default for
         # the data source.
@@ -456,7 +456,7 @@ class TestCirculationData(DatabaseTest):
         )
         circulation_data.apply(self._db, pool.collection, replace)
         eq_(True, pool.open_access)
-        eq_(1, pool.delivery_mechanisms.count())
+        eq_(1, len(pool.delivery_mechanisms))
         eq_(RightsStatus.CC_BY_ND, pool.delivery_mechanisms[0].rights_status.uri)
 
     def test_rights_status_commercial_link_with_rights(self):
@@ -493,7 +493,7 @@ class TestCirculationData(DatabaseTest):
         )
         circulation_data.apply(self._db, pool.collection, replace)
         eq_(False, pool.open_access)
-        eq_(1, pool.delivery_mechanisms.count())
+        eq_(1, len(pool.delivery_mechanisms))
         eq_(RightsStatus.IN_COPYRIGHT, pool.delivery_mechanisms[0].rights_status.uri)
 
     def test_format_change_may_change_open_access_status(self):
@@ -542,7 +542,7 @@ class TestCirculationData(DatabaseTest):
 
         # The original LPDM has been removed and only the new one remains.
         eq_(False, pool.open_access)
-        eq_(1, pool.delivery_mechanisms.count())
+        eq_(1, len(pool.delivery_mechanisms))
 
 
 class TestMetaToModelUtility(DatabaseTest):
@@ -553,7 +553,7 @@ class TestMetaToModelUtility(DatabaseTest):
         # Note: Mirroring tests passing does not guarantee that all code now 
         # correctly calls on CirculationData, as well as Metadata.  This is a risk.
 
-        mirror = DummyS3Uploader()
+        mirror = MockS3Uploader()
         # Here's a book.
         edition, pool = self._edition(with_license_pool=True)
         
@@ -603,7 +603,7 @@ class TestMetaToModelUtility(DatabaseTest):
 
 
         # It's been 'mirrored' to the appropriate S3 bucket.
-        assert book.mirror_url.startswith('http://s3.amazonaws.com/test.content.bucket/')
+        assert book.mirror_url.startswith('https://s3.amazonaws.com/test.content.bucket/')
         expect = '/%s/%s.epub' % (
             edition.primary_identifier.identifier,
             edition.title
@@ -613,7 +613,7 @@ class TestMetaToModelUtility(DatabaseTest):
         # make sure the mirrored link is safely on edition
         sorted_edition_links = sorted(pool.identifier.links, key=lambda x: x.rel)
         unmirrored_representation, mirrored_representation = [edlink.resource.representation for edlink in sorted_edition_links]
-        assert mirrored_representation.mirror_url.startswith('http://s3.amazonaws.com/test.content.bucket/')
+        assert mirrored_representation.mirror_url.startswith('https://s3.amazonaws.com/test.content.bucket/')
 
         # make sure the unmirrored link is safely on edition
         eq_('http://example.com/2', unmirrored_representation.url)
@@ -622,7 +622,7 @@ class TestMetaToModelUtility(DatabaseTest):
 
 
     def test_mirror_open_access_link_fetch_failure(self):
-        mirror = DummyS3Uploader()
+        mirror = MockS3Uploader()
         h = DummyHTTPClient()
 
         edition, pool = self._edition(with_license_pool=True)
@@ -665,7 +665,7 @@ class TestMetaToModelUtility(DatabaseTest):
 
 
     def test_mirror_open_access_link_mirror_failure(self):
-        mirror = DummyS3Uploader(fail=True)
+        mirror = MockS3Uploader(fail=True)
         h = DummyHTTPClient()
 
         edition, pool = self._edition(with_license_pool=True)
@@ -705,9 +705,8 @@ class TestMetaToModelUtility(DatabaseTest):
         eq_(link.media_type, representation.media_type)
         eq_(link.href, representation.url)
 
-        # The mirror url should still be set.
-        assert "Gutenberg" in representation.mirror_url
-        assert representation.mirror_url.endswith("%s.epub" % edition.title)
+        # The mirror url was never set.
+        eq_(None, representation.mirror_url)
 
         # Book content is still there since it wasn't mirrored.
         assert representation.content != None

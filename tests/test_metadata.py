@@ -8,6 +8,7 @@ import pkgutil
 import csv
 from copy import deepcopy
 
+from classifier import Classifier
 from metadata_layer import (
     CSVFormatError,
     CSVMetadataImporter,
@@ -16,6 +17,7 @@ from metadata_layer import (
     MeasurementData,
     FormatData,
     LinkData,
+    MARCExtractor,
     Metadata,
     IdentifierData,
     ReplacementPolicy,
@@ -41,9 +43,10 @@ from model import (
 from . import (
     DatabaseTest,
     DummyHTTPClient,
+    DummyMetadataClient,
 )
 
-from s3 import DummyS3Uploader
+from s3 import MockS3Uploader
 from classifier import NO_VALUE, NO_NUMBER
 
 class TestIdentifierData(object):
@@ -145,6 +148,44 @@ class TestMetadataImporter(DatabaseTest):
 
         eq_(Hyperlink.DESCRIPTION, description.rel)
         eq_("foo", description.resource.representation.content)
+
+    def test_image_with_original_and_rights(self):
+        edition = self._edition()
+        data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
+        original = LinkData(rel=Hyperlink.IMAGE,
+                            href="http://example.com/",
+                            media_type=Representation.PNG_MEDIA_TYPE,
+                            rights_uri=RightsStatus.PUBLIC_DOMAIN_USA,
+                            rights_explanation="This image is from 1922",
+                            )
+        image_data = '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x01\x03\x00\x00\x00%\xdbV\xca\x00\x00\x00\x06PLTE\xffM\x00\x01\x01\x01\x8e\x1e\xe5\x1b\x00\x00\x00\x01tRNS\xcc\xd24V\xfd\x00\x00\x00\nIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82'
+        derivative = LinkData(rel=Hyperlink.IMAGE,
+                              href="generic uri",
+                              content=image_data,
+                              media_type=Representation.PNG_MEDIA_TYPE,
+                              rights_uri=RightsStatus.PUBLIC_DOMAIN_USA,
+                              rights_explanation="This image is from 1922",
+                              original=original,
+                              transformation_settings=dict(position='top')
+                              )
+
+        metadata = Metadata(links=[derivative], data_source=data_source)
+        metadata.apply(edition, None)
+        [image] = edition.primary_identifier.links
+        eq_(Hyperlink.IMAGE, image.rel)
+        eq_("generic uri", image.resource.url)
+        eq_(image_data, image.resource.representation.content)
+        eq_(RightsStatus.PUBLIC_DOMAIN_USA, image.resource.rights_status.uri)
+        eq_("This image is from 1922", image.resource.rights_explanation)
+
+        eq_([], image.resource.transformations)
+        transformation = image.resource.derived_through
+        eq_(image.resource, transformation.derivative)
+
+        eq_("http://example.com/", transformation.original.url)
+        eq_(RightsStatus.PUBLIC_DOMAIN_USA, transformation.original.rights_status.uri)
+        eq_("This image is from 1922", transformation.original.rights_explanation)
+        eq_("top", transformation.settings.get("position"))
 
     def test_image_and_thumbnail(self):
         edition = self._edition()
@@ -287,7 +328,7 @@ class TestMetadataImporter(DatabaseTest):
         # However, updated tests passing does not guarantee that all code now 
         # correctly calls on CirculationData, too.  This is a risk.
 
-        mirror = DummyS3Uploader()
+        mirror = MockS3Uploader()
         edition, pool = self._edition(with_license_pool=True)
         content = open(self.sample_cover_path("test-book-cover.png")).read()
         l1 = LinkData(
@@ -333,16 +374,16 @@ class TestMetadataImporter(DatabaseTest):
         assert thumbnail.content != l2.content
 
         # Both images have been 'mirrored' to Amazon S3.
-        assert image.mirror_url.startswith('http://s3.amazonaws.com/test.cover.bucket/')
+        assert image.mirror_url.startswith('https://s3.amazonaws.com/test.cover.bucket/')
         assert image.mirror_url.endswith('cover.jpg')
 
         # The thumbnail image has been converted to PNG.
-        assert thumbnail.mirror_url.startswith('http://s3.amazonaws.com/test.cover.bucket/scaled/300/')
+        assert thumbnail.mirror_url.startswith('https://s3.amazonaws.com/test.cover.bucket/scaled/300/')
         assert thumbnail.mirror_url.endswith('cover.png')
 
     def test_mirror_thumbnail_only(self):
         # Make sure a thumbnail image is mirrored when there's no cover image.
-        mirror = DummyS3Uploader()
+        mirror = MockS3Uploader()
         edition, pool = self._edition(with_license_pool=True)
         thumbnail_content = open(self.sample_cover_path("tiny-image-cover.png")).read()
         l = LinkData(
@@ -359,7 +400,7 @@ class TestMetadataImporter(DatabaseTest):
         [thumbnail] = mirror.uploaded
 
         # The image has been 'mirrored' to Amazon S3.
-        assert thumbnail.mirror_url.startswith('http://s3.amazonaws.com/test.cover.bucket/')
+        assert thumbnail.mirror_url.startswith('https://s3.amazonaws.com/test.cover.bucket/')
         assert thumbnail.mirror_url.endswith('thumb.png')
 
     def test_mirror_open_access_link_fetch_failure(self):
@@ -368,7 +409,7 @@ class TestMetadataImporter(DatabaseTest):
         data_source = DataSource.lookup(self._db, DataSource.GUTENBERG)
         m = Metadata(data_source=data_source)
 
-        mirror = DummyS3Uploader()
+        mirror = MockS3Uploader()
         h = DummyHTTPClient()
 
         policy = ReplacementPolicy(mirror=mirror, http_get=h.do_get)
@@ -406,7 +447,7 @@ class TestMetadataImporter(DatabaseTest):
         eq_(None, pool.license_exception)
 
     def test_mirror_404_error(self):
-        mirror = DummyS3Uploader()
+        mirror = MockS3Uploader()
         h = DummyHTTPClient()
         h.queue_response(404)
         policy = ReplacementPolicy(mirror=mirror, http_get=h.do_get)
@@ -441,7 +482,7 @@ class TestMetadataImporter(DatabaseTest):
         data_source = DataSource.lookup(self._db, DataSource.GUTENBERG)
         m = Metadata(data_source=data_source)
 
-        mirror = DummyS3Uploader(fail=True)
+        mirror = MockS3Uploader(fail=True)
         h = DummyHTTPClient()
 
         policy = ReplacementPolicy(mirror=mirror, http_get=h.do_get)
@@ -469,15 +510,14 @@ class TestMetadataImporter(DatabaseTest):
         eq_(None, representation.fetch_exception)
         assert representation.fetched_at != None
 
-        # But mirroing failed.
+        # But mirroring failed.
         assert representation.mirror_exception != None
         eq_(None, representation.mirrored_at)
         eq_(link.media_type, representation.media_type)
         eq_(link.href, representation.url)
 
-        # The mirror url should still be set.
-        assert "Gutenberg" in representation.mirror_url
-        assert representation.mirror_url.endswith("%s/cover.jpg" % edition.primary_identifier.identifier)
+        # The mirror url is not set.
+        eq_(None, representation.mirror_url)
 
         # Book content is still there since it wasn't mirrored.
         assert representation.content != None
@@ -490,11 +530,99 @@ class TestMetadataImporter(DatabaseTest):
         # if fetch failed on getting an Hyperlink.OPEN_ACCESS_DOWNLOAD-type epub.
         eq_(None, pool.license_exception)
 
+    def test_mirror_link_bad_media_type(self):
+        edition, pool = self._edition(with_license_pool=True)
+
+        data_source = DataSource.lookup(self._db, DataSource.GUTENBERG)
+        m = Metadata(data_source=data_source)
+
+        mirror = MockS3Uploader()
+        h = DummyHTTPClient()
+
+        policy = ReplacementPolicy(mirror=mirror, http_get=h.do_get)
+
+        content = open(self.sample_cover_path("test-book-cover.png")).read()
+
+        # We thought this link was for an image file.
+        link = LinkData(
+            rel=Hyperlink.IMAGE,
+            media_type=Representation.JPEG_MEDIA_TYPE,
+            href="http://example.com/",
+            content=content
+        )
+        link_obj, ignore = edition.primary_identifier.add_link(
+            rel=link.rel, href=link.href, data_source=data_source,
+        )
+
+        # The remote server told us a generic media type.
+        h.queue_response(200, media_type=Representation.OCTET_STREAM_MEDIA_TYPE, content=content)
+        
+        m.mirror_link(edition, data_source, link, link_obj, policy)
+        representation = link_obj.resource.representation
+
+        # The representation was fetched and mirrored successfully.
+        # We assumed the original image media type was correct.
+        eq_(None, representation.fetch_exception)
+        assert representation.fetched_at != None
+        eq_(None, representation.mirror_exception)
+        assert representation.mirrored_at != None
+        eq_(Representation.JPEG_MEDIA_TYPE, representation.media_type)
+        eq_(link.href, representation.url)
+        assert "Gutenberg" in representation.mirror_url
+        assert representation.mirror_url.endswith("%s/cover.jpg" % edition.primary_identifier.identifier)
+
+        # We don't know the media type for this link, but it has a file extension.
+        link = LinkData(
+            rel=Hyperlink.IMAGE,
+            href="http://example.com/image.png",
+            content=content
+        )
+        link_obj, ignore = edition.primary_identifier.add_link(
+            rel=link.rel, href=link.href, data_source=data_source,
+        )
+        h.queue_response(200, media_type=Representation.OCTET_STREAM_MEDIA_TYPE, content=content)
+        m.mirror_link(edition, data_source, link, link_obj, policy)
+        representation = link_obj.resource.representation
+
+        # The representation is still fetched and mirrored successfully.
+        # We used the media type from the file extension.
+        eq_(None, representation.fetch_exception)
+        assert representation.fetched_at != None
+        eq_(None, representation.mirror_exception)
+        assert representation.mirrored_at != None
+        eq_(Representation.PNG_MEDIA_TYPE, representation.media_type)
+        eq_(link.href, representation.url)
+        assert "Gutenberg" in representation.mirror_url
+        assert representation.mirror_url.endswith("%s/image.png" % edition.primary_identifier.identifier)
+
+        # We don't know the media type of this link, and there's no extension.
+        link = LinkData(
+            rel=Hyperlink.IMAGE,
+            href="http://example.com/unknown",
+            content=content
+        )
+        link_obj, ignore = edition.primary_identifier.add_link(
+            rel=link.rel, href=link.href, data_source=data_source,
+        )
+        h.queue_response(200, media_type=Representation.OCTET_STREAM_MEDIA_TYPE, content=content)
+        m.mirror_link(edition, data_source, link, link_obj, policy)
+        representation = link_obj.resource.representation
+
+        # The representation is fetched, but we don't try to mirror it
+        # since it doesn't have a mirrorable media type.
+        eq_(None, representation.fetch_exception)
+        assert representation.fetched_at != None
+        eq_(None, representation.mirror_exception)
+        eq_(None, representation.mirrored_at)
+        eq_(Representation.OCTET_STREAM_MEDIA_TYPE, representation.media_type)
+        eq_(link.href, representation.url)
+        eq_(None, representation.mirror_url)
+
     def test_non_open_access_book_not_mirrored(self):        
         data_source = DataSource.lookup(self._db, DataSource.GUTENBERG)
         m = Metadata(data_source=data_source)
 
-        mirror = DummyS3Uploader(fail=True)
+        mirror = MockS3Uploader(fail=True)
         h = DummyHTTPClient()
 
         policy = ReplacementPolicy(mirror=mirror, http_get=h.do_get)
@@ -531,7 +659,7 @@ class TestMetadataImporter(DatabaseTest):
         data_source = DataSource.lookup(self._db, DataSource.GUTENBERG)
         m = Metadata(data_source=data_source)
 
-        mirror = DummyS3Uploader()
+        mirror = MockS3Uploader()
         def dummy_content_modifier(representation):
             representation.content = "Replaced Content"
         h = DummyHTTPClient()
@@ -689,7 +817,56 @@ class TestContributorData(DatabaseTest):
         contributor_new, changed = contributor_data.apply(contributor_new)
         eq_(changed, False)
 
+    def test_display_name_to_sort_name_from_existing_contributor(self):
+        # If there's an existing contributor with a matching display name,
+        # we'll use their sort name.
+        existing_contributor, ignore = self._contributor(sort_name="Sort, Name", display_name="John Doe")
+        eq_("Sort, Name", ContributorData.display_name_to_sort_name_from_existing_contributor(self._db, "John Doe"))
 
+        # Otherwise, we don't know.
+        eq_(None, ContributorData.display_name_to_sort_name_from_existing_contributor(self._db, "Jane Doe"))
+
+    def test_find_sort_name(self):
+        metadata_client = DummyMetadataClient()
+        metadata_client.lookups["Metadata Client Author"] = "Author, M. C."
+        existing_contributor, ignore = self._contributor(sort_name="Author, E.", display_name="Existing Author")
+        contributor_data = ContributorData()
+
+        # If there's already a sort name, keep it.
+        contributor_data.sort_name = "Sort Name"
+        eq_(True, contributor_data.find_sort_name(self._db, [], metadata_client))
+        eq_("Sort Name", contributor_data.sort_name)
+        
+        contributor_data.sort_name = "Sort Name"
+        contributor_data.display_name = "Existing Author"
+        eq_(True, contributor_data.find_sort_name(self._db, [], metadata_client))
+        eq_("Sort Name", contributor_data.sort_name)
+
+        contributor_data.sort_name = "Sort Name"
+        contributor_data.display_name = "Metadata Client Author"
+        eq_(True, contributor_data.find_sort_name(self._db, [], metadata_client))
+        eq_("Sort Name", contributor_data.sort_name)
+
+        # If there's no sort name but there's already an author with the same display name,
+        # use that author's sort name.
+        contributor_data.sort_name = None
+        contributor_data.display_name = "Existing Author"
+        eq_(True, contributor_data.find_sort_name(self._db, [], metadata_client))
+        eq_("Author, E.", contributor_data.sort_name)
+
+        # If there's no sort name and no existing author, check the metadata wrangler
+        # for a sort name.
+        contributor_data.sort_name = None
+        contributor_data.display_name = "Metadata Client Author"
+        eq_(True, contributor_data.find_sort_name(self._db, [], metadata_client))
+        eq_("Author, M. C.", contributor_data.sort_name)
+
+        # If there's no sort name, no existing author, and nothing from the metadata
+        # wrangler, guess the sort name based on the display name.
+        contributor_data.sort_name = None
+        contributor_data.display_name = "New Author"
+        eq_(True, contributor_data.find_sort_name(self._db, [], metadata_client))
+        eq_("Author, New", contributor_data.sort_name)
 
 class TestLinkData(DatabaseTest):
 
@@ -741,6 +918,11 @@ class TestMetadata(DatabaseTest):
         eq_(e_link.rel, m_link.rel)
         eq_(e_link.resource.url, m_link.href)
 
+        # The series position can also be 0.
+        edition.series_position = 0
+        metadata = Metadata.from_edition(edition)
+        eq_(edition.series_position, metadata.series_position)
+
     def test_update(self):
         # Tests that Metadata.update correctly prefers new fields to old, unless 
         # new fields aren't defined.
@@ -748,18 +930,24 @@ class TestMetadata(DatabaseTest):
         edition_old, pool = self._edition(with_license_pool=True)
         edition_old.publisher = "test_old_publisher"
         edition_old.subtitle = "old_subtitile"
+        edition_old.series = "old_series"
+        edition_old.series_position = 5
         metadata_old = Metadata.from_edition(edition_old)
 
         edition_new, pool = self._edition(with_license_pool=True)
         # set more fields on metadatas
         edition_new.publisher = None
         edition_new.subtitle = "new_updated_subtitile"
+        edition_new.series = "new_series"
+        edition_new.series_position = 0
         metadata_new = Metadata.from_edition(edition_new)
 
         metadata_old.update(metadata_new)
 
         eq_(metadata_old.publisher, "test_old_publisher")
         eq_(metadata_old.subtitle, metadata_new.subtitle)
+        eq_(metadata_old.series, edition_new.series)
+        eq_(metadata_old.series_position, edition_new.series_position)
 
     def test_apply(self):
         edition_old, pool = self._edition(with_license_pool=True)
@@ -796,6 +984,12 @@ class TestMetadata(DatabaseTest):
 
         edition_new, changed = metadata.apply(edition_new, pool.collection)
         eq_(changed, False)
+
+        # The series position can also be 0.
+        metadata.series_position = 0
+        edition_new, changed = metadata.apply(edition_new, pool.collection)
+        eq_(changed, True)
+        eq_(edition_new.series_position, 0)
 
     def test_apply_identifier_equivalency(self):
 
@@ -1087,3 +1281,54 @@ class TestAssociateWithIdentifiersBasedOnPermanentWorkID(DatabaseTest):
         equivalent_identifiers = [x.output for x in identifier.equivalencies]
         eq_([book.primary_identifier], equivalent_identifiers)
     
+
+class TestMARCExtractor(DatabaseTest):
+
+    def setup(self):
+        super(TestMARCExtractor, self).setup()
+        base_path = os.path.split(__file__)[0]
+        self.resource_path = os.path.join(base_path, "files", "marc")
+
+    def sample_data(self, filename):
+        with open(os.path.join(self.resource_path, filename)) as fh:
+            return fh.read()
+
+    def test_parse_year(self):
+        m = MARCExtractor.parse_year
+        nineteen_hundred = datetime.datetime.strptime("1900", "%Y")
+        eq_(nineteen_hundred, m("1900"))
+        eq_(nineteen_hundred, m("1900."))
+        eq_(None, m("not a year"))
+
+    def test_parser(self):
+        """Parse a MARC file into Metadata objects."""
+
+        file = self.sample_data("ils_plympton_01.mrc")
+        metadata_records = MARCExtractor.parse(file, "Plympton")
+
+        eq_(36, len(metadata_records))
+
+        record = metadata_records[1]
+        eq_("Strange Case of Dr Jekyll and Mr Hyde", record.title)
+        eq_("Stevenson, Robert Louis", record.contributors[0].sort_name)
+        assert "Recovering the Classics" in record.publisher
+        eq_("9781682280041", record.primary_identifier.identifier)
+        eq_(Identifier.ISBN, record.primary_identifier.type)
+        subjects = record.subjects
+        eq_(2, len(subjects))
+        for s in subjects:
+            eq_(Classifier.FAST, s.type)
+        assert "Canon" in subjects[0].identifier
+        eq_(Edition.BOOK_MEDIUM, record.medium)
+        eq_(2015, record.issued.year)
+        eq_('eng', record.language)
+
+        eq_(1, len(record.links))
+        assert "Utterson and Enfield are worried about their friend" in record.links[0].content
+
+    def test_name_cleanup(self):
+        """Test basic name cleanup techniques."""
+        m = MARCExtractor.name_cleanup
+        eq_("Dante Alighieri", m("Dante Alighieri,   1265-1321, author."))
+        eq_("Stevenson, Robert Louis", m("Stevenson, Robert Louis."))
+        eq_("Wells, H.G.", m("Wells,     H.G."))

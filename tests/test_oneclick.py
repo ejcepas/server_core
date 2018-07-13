@@ -189,13 +189,17 @@ class TestOneClickRepresentationExtractor(OneClickTest):
         eq_(12, metadata.published.month)
         eq_(27, metadata.published.day)
 
-        [author1, author2] = metadata.contributors
+        [author1, author2, narrator] = metadata.contributors
         eq_(u"Mccall Smith, Alexander", author1.sort_name)
         eq_(u"Alexander Mccall Smith", author1.display_name)
         eq_([Contributor.AUTHOR_ROLE], author1.roles)
         eq_(u"Wilder, Thornton", author2.sort_name)
         eq_(u"Thornton Wilder", author2.display_name)
         eq_([Contributor.AUTHOR_ROLE], author2.roles)
+
+        eq_(u"Guskin, Laura Flanagan", narrator.sort_name)
+        eq_(u"Laura Flanagan Guskin", narrator.display_name)
+        eq_([Contributor.NARRATOR_ROLE], narrator.roles)
 
         subjects = sorted(metadata.subjects, key=lambda x: x.identifier)
 
@@ -398,12 +402,17 @@ class TestOneClickSyncMonitor(DatabaseTest):
             self._db, DataSource.ONECLICK, Identifier.ONECLICK_ID,
             "9780062231727", collection=self.collection
         )
+        eq_(1, pool.licenses_owned)
+        eq_(1, pool.licenses_available)
+
         eq_(False, made_new)
         pool, made_new = LicensePool.for_foreign_id(
             self._db, DataSource.ONECLICK, Identifier.ONECLICK_ID,
             "9781615730186", collection=self.collection
         )
         eq_(False, made_new)
+        eq_(1, pool.licenses_owned)
+        eq_(1, pool.licenses_available)
 
         # make sure there are 8 LicensePools
         pools = self._db.query(LicensePool).all()

@@ -50,7 +50,7 @@ from util.http import (
     BadResponseException,
 )
 
-from util.personal_names import display_name_to_sort_name
+from util.personal_names import sort_name_to_display_name
 
 from testing import MockRequestsResponse
 
@@ -147,18 +147,37 @@ class OdiloAPI(object):
         response = self.token_post(
             self.TOKEN_ENDPOINT,
             dict(grant_type="client_credentials"),
-            allowed_response_codes=[200]
+            allowed_response_codes=[200, 400]
         )
-        data = response.json()
+
+        # If you put in the wrong URL, this is where you'll run into
+        # problems, so it's useful to give a helpful error message if
+        # Odilo doesn't provide anything more specific.
+        generic_error = "%s may not be the right base URL. Response document was: %r" % (
+            self.library_api_base_url, response.content
+        )
+        generic_exception = BadResponseException(
+            self.TOKEN_ENDPOINT, generic_error
+        )
+
+        try:
+            data = response.json()
+        except ValueError:
+            raise generic_exception
 
         if response.status_code == 200:
             self._update_credential(credential, data)
             self.token = credential.credential
+            return
         elif response.status_code == 400:
             if data and 'errors' in data and len(data['errors']) > 0:
                 error = data['errors'][0]
-                message = ('description' in error and error['description']) or ''
-                raise BadResponseException(message)
+                if 'description' in error:
+                    message = error['description']
+                else:
+                    message = generic_error
+                raise BadResponseException(self.TOKEN_ENDPOINT, message)
+        raise generic_exception
 
     def get(self, url, extra_headers={}, exception_on_401=False):
         """Make an HTTP GET request using the active Bearer Token."""
@@ -195,8 +214,12 @@ class OdiloAPI(object):
     def _update_credential(credential, odilo_data):
         """Copy Odilo OAuth data into a Credential object."""
         credential.credential = odilo_data['token']
-        expires_in = (odilo_data['expiresIn'] * 0.9)
-        credential.expires = datetime.datetime.utcnow() + datetime.timedelta(seconds=expires_in)
+        if odilo_data['expiresIn'] == -1:
+            # This token never expires.
+            credential.expires = None
+        else:
+            expires_in = (odilo_data['expiresIn'] * 0.9)
+            credential.expires = datetime.datetime.utcnow() + datetime.timedelta(seconds=expires_in)
 
     def get_metadata(self, record_id):
         identifier = record_id
@@ -287,8 +310,8 @@ class MockOdiloAPI(OdiloAPI):
         response = self.access_token_response
         return HTTP._process_response(url, response, **kwargs)
 
-    def mock_access_token_response(self, credential):
-        token = dict(token=credential, expiresIn=3600)
+    def mock_access_token_response(self, credential, expires_in=-1):
+        token = dict(token=credential, expiresIn=expires_in)
         return MockRequestsResponse(200, {}, json.dumps(token))
 
     def queue_response(self, status_code, headers={}, content=None):
@@ -424,11 +447,14 @@ class OdiloRepresentationExtractor(object):
             series_position = None
 
         contributors = []
-        author = book.get('author')
-        if author:
+        sort_author = book.get('author')
+        if sort_author:
             roles = [Contributor.AUTHOR_ROLE]
-            sort_author = display_name_to_sort_name(author)
-            contributor = ContributorData(sort_name=sort_author, display_name=author, roles=roles, biography=None)
+            display_author = sort_name_to_display_name(sort_author)
+            contributor = ContributorData(
+                sort_name=sort_author, display_name=display_author,
+                roles=roles, biography=None
+            )
             contributors.append(contributor)
 
         publisher = book.get('publisher')
@@ -453,7 +479,7 @@ class OdiloRepresentationExtractor(object):
             except ValueError as e:
                 cls.log.warn('Cannot parse last update date from: ' + last_update + ', message: ' + e.message)
 
-        language = book.get('language')
+        language = book.get('language', 'spa')
 
         subjects = []
         for subject in book.get('subjects', []):

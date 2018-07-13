@@ -28,6 +28,7 @@ from model import (
     DataSource,
     DeliveryMechanism,
     ExternalIntegration,
+    Hyperlink,
     LicensePool,
     Edition,
     Identifier,
@@ -42,6 +43,7 @@ from metadata_layer import (
     FormatData,
     IdentifierData,
     CirculationData,
+    LinkData,
     Metadata,
 )
 
@@ -362,6 +364,7 @@ class BibliographicParser(Axis360Parser):
     DELIVERY_DATA_FOR_AXIS_FORMAT = {
         "Blio" : None,
         "Acoustik" : None,
+        "AxisNow": None,
         "ePub" : (Representation.EPUB_MEDIA_TYPE, DeliveryMechanism.ADOBE_DRM),
         "PDF" : (Representation.PDF_MEDIA_TYPE, DeliveryMechanism.ADOBE_DRM),
     }
@@ -439,7 +442,27 @@ class BibliographicParser(Axis360Parser):
     )
 
     @classmethod
-    def parse_contributor(cls, author, primary_author_found=False):
+    def parse_contributor(cls, author, primary_author_found=False,
+                          force_role=None):
+        """Parse an Axis 360 contributor string.
+
+        The contributor string looks like "Butler, Octavia" or "Walt
+        Disney Pictures (COR)" or "Rex, Adam (ILT)". The optional
+        three-letter code describes the contributor's role in the
+        book.
+
+        :param author: The string to parse.
+
+        :param primary_author_found: If this is false, then a
+            contributor with no three-letter code will be treated as
+            the primary author. If this is true, then a contributor
+            with no three-letter code will be treated as just a
+            regular author.
+
+        :param force_role: If this is set, the contributor will be
+            assigned this role, no matter what. This takes precedence
+            over the value implied by primary_author_found.
+        """
         if primary_author_found:
             default_author_role = Contributor.AUTHOR_ROLE
         else:
@@ -453,9 +476,11 @@ class BibliographicParser(Axis360Parser):
             if role is cls.generic_author:
                 role = default_author_role
             author = author[:-5].strip()
+        if force_role:
+            role = force_role
         return ContributorData(
-            sort_name=author, roles=role)
-
+            sort_name=author, roles=[role]
+        )
 
     def extract_bibliographic(self, element, ns):
         """Turn bibliographic metadata into a Metadata and a CirculationData objects, 
@@ -465,9 +490,7 @@ class BibliographicParser(Axis360Parser):
         # audiobooks) so I don't know what they do and/or what format
         # they're in.
         #
-        # annotation
         # edition
-        # narrator
         # runtime
 
         identifier = self.text_of_subtag(element, 'axis:titleId', ns)
@@ -485,6 +508,29 @@ class BibliographicParser(Axis360Parser):
                 if Contributor.PRIMARY_AUTHOR_ROLE in contributor.roles:
                     found_primary_author = True
                 contributors.append(contributor)
+
+        narrator = self.text_of_optional_subtag(
+            element, 'axis:narrator', ns
+        )
+        if narrator:
+            for n in self.parse_list(narrator):
+                contributor = self.parse_contributor(
+                    n, force_role=Contributor.NARRATOR_ROLE
+                )
+                contributors.append(contributor)
+
+        links = []
+        description = self.text_of_optional_subtag(
+            element, 'axis:annotation', ns
+        )
+        if description:
+            links.append(
+                LinkData(
+                    rel=Hyperlink.DESCRIPTION,
+                    content=description,
+                    media_type=Representation.TEXT_PLAIN,
+                )
+            )
 
         subject = self.text_of_optional_subtag(element, 'axis:subject', ns)
         subjects = []
@@ -536,7 +582,7 @@ class BibliographicParser(Axis360Parser):
             informal_name = format_tag.text
             seen_formats.append(informal_name)
             if informal_name not in self.DELIVERY_DATA_FOR_AXIS_FORMAT:
-                self.log.error("Unrecognized Axis format name for %s: %s" % (
+                self.log.warn("Unrecognized Axis format name for %s: %s" % (
                     identifier, informal_name
                 ))
             elif self.DELIVERY_DATA_FOR_AXIS_FORMAT.get(informal_name):
@@ -566,6 +612,7 @@ class BibliographicParser(Axis360Parser):
             identifiers=identifiers,
             subjects=subjects,
             contributors=contributors,
+            links=links,
         )
 
         circulationdata = CirculationData(

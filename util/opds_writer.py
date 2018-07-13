@@ -8,6 +8,10 @@ from nose.tools import set_trace
 
 class AtomFeed(object):
 
+    ATOM_TYPE = 'application/atom+xml'
+
+    ATOM_LIKE_TYPES = [ATOM_TYPE, 'application/xml']
+
     TIME_FORMAT = '%Y-%m-%dT%H:%M:%SZ%z'
 
     ATOM_NS = 'http://www.w3.org/2005/Atom'
@@ -17,19 +21,23 @@ class AtomFeed(object):
     OPDS_NS = 'http://opds-spec.org/2010/catalog'
     SCHEMA_NS = 'http://schema.org/'
     DRM_NS = 'http://librarysimplified.org/terms/drm'
-    
+    OPF_NS = 'http://www.idpf.org/2007/opf'
+
     SIMPLIFIED_NS = "http://librarysimplified.org/terms/"
     BIBFRAME_NS = "http://bibframe.org/vocab/"
+    BIB_SCHEMA_NS = "http://bib.schema.org/"
 
     nsmap = {
         None: ATOM_NS,
         'app': APP_NS,
         'dcterms' : DCTERMS_NS,
         'opds' : OPDS_NS,
+        'opf' : OPF_NS,
         'drm' : DRM_NS,
         'schema' : SCHEMA_NS,
         'simplified' : SIMPLIFIED_NS,
         'bibframe' : BIBFRAME_NS,
+        'bib': BIB_SCHEMA_NS
     }
 
     default_typemap = {datetime: lambda e, v: _strftime(v)}
@@ -68,6 +76,9 @@ class AtomFeed(object):
     def author(cls, *args, **kwargs):
         return cls.E.author(*args, **kwargs)
 
+    @classmethod
+    def contributor(cls, *args, **kwargs):
+        return cls.E.contributor(*args, **kwargs)
 
     @classmethod
     def category(cls, *args, **kwargs):
@@ -126,7 +137,7 @@ class AtomFeed(object):
     def __init__(self, title, url):
         self.feed = self.E.feed(
             self.E.id(url),
-            self.E.title(str(title)),
+            self.E.title(unicode(title)),
             self.E.updated(self._strftime(datetime.datetime.utcnow())),
             self.E.link(href=url, rel="self"),
         )
@@ -143,9 +154,9 @@ class AtomFeed(object):
 
 class OPDSFeed(AtomFeed):
 
-    ACQUISITION_FEED_TYPE = "application/atom+xml;profile=opds-catalog;kind=acquisition"
-    NAVIGATION_FEED_TYPE = "application/atom+xml;profile=opds-catalog;kind=navigation"
-    ENTRY_TYPE = "application/atom+xml;type=entry;profile=opds-catalog"
+    ACQUISITION_FEED_TYPE = AtomFeed.ATOM_TYPE + ";profile=opds-catalog;kind=acquisition"
+    NAVIGATION_FEED_TYPE = AtomFeed.ATOM_TYPE + ";profile=opds-catalog;kind=navigation"
+    ENTRY_TYPE = AtomFeed.ATOM_TYPE + ";type=entry;profile=opds-catalog"
 
     GROUP_REL = "collection"
     FEATURED_REL = "http://opds-spec.org/featured"
@@ -154,7 +165,7 @@ class OPDSFeed(AtomFeed):
     OPEN_ACCESS_REL = "http://opds-spec.org/acquisition/open-access"
     ACQUISITION_REL = "http://opds-spec.org/acquisition"
     BORROW_REL = "http://opds-spec.org/acquisition/borrow"
-    FULL_IMAGE_REL = "http://opds-spec.org/image" 
+    FULL_IMAGE_REL = "http://opds-spec.org/image"
     EPUB_MEDIA_TYPE = "application/epub+zip"
 
     REVOKE_LOAN_REL = "http://librarysimplified.org/terms/rel/revoke"
@@ -195,7 +206,7 @@ class OPDSMessage(object):
             or self.message != other.message):
             return False
         return True
-        
+
     @property
     def tag(self):
         message_tag = AtomFeed.SIMPLIFIED.message()
