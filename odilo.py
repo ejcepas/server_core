@@ -419,6 +419,9 @@ class OdiloRepresentationExtractor(object):
         subtitle = book.get('subtitle')
         series = book.get('series')
         series_position = book.get('seriesPosition')
+        if series_position and not series_position.isdigit():
+            cls.log.warn('Invalid series postion value (not int): ' + series_position)
+            series_position = None
 
         contributors = []
         author = book.get('author')
